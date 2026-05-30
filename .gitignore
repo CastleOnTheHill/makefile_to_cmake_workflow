@@ -1,0 +1,47 @@
+# Secrets
+mykey.txt
+pswd.txt
+*.key
+*.pem
+*.env
+.env
+
+# Local tool installs
+.tools/
+node_modules/
+.opencode/node_modules/
+.opencode/package-lock.json
+.opencode/package.json
+
+# Downloaded demo sources and build outputs
+demo/*/src/
+demo/*/original/
+demo/*/cmake-build/
+demo/*/converted/
+demo/*/converted_artifacts.txt
+
+# Workflow runtime state
+workflow/logs/
+workflow/opencode/
+workflow/manual_required.md
+
+# Python/cache/build noise
+__pycache__/
+*.py[cod]
+.cache/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build/
+out/
+dist/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
