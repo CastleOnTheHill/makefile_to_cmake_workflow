@@ -74,6 +74,14 @@ def write_text(path: pathlib.Path, text: str) -> None:
     path.write_text(text)
 
 
+def progress(index: int, total: int, label: str) -> None:
+    total = max(total, 1)
+    width = 28
+    filled = min(width, int(width * index / total))
+    bar = "#" * filled + "-" * (width - filled)
+    print(f"[{index:>3}/{total:<3}] [{bar}] {label}", flush=True)
+
+
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -153,4 +161,3 @@ def require_args(argv: list[str], usage: str) -> str:
         print(usage, file=sys.stderr)
         raise SystemExit(2)
     return argv[1]
-

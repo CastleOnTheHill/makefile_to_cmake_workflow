@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import pathlib
 import subprocess
-import sys
 
-from common import append_jsonl, error_excerpt, failure_signature, load_config, now, rel, require_args, run, write_text
+from common import append_jsonl, error_excerpt, failure_signature, load_config, now, progress, rel, run, write_text
 
 
 def run_shell(command: str, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
@@ -60,7 +60,11 @@ Make the smallest CMake edit that should advance the build. Do not run builds.
 
 
 def main() -> int:
-    cfg = load_config(require_args(sys.argv, "usage: build_repair_loop.py <config.json>"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config")
+    parser.add_argument("--limit", type=int, default=0, help="maximum number of products to build")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
     state = pathlib.Path(cfg["state_dir"])
     logs_dir = state / "logs"
     prompts_dir = state / "prompts"
@@ -71,10 +75,15 @@ def main() -> int:
     excerpt_lines = int(cfg.get("error_excerpt_lines", 160))
     root = pathlib.Path(cfg["project_root"])
 
-    for product in cfg.get("products", []):
+    products = cfg.get("products", [])
+    if args.limit > 0:
+        products = products[: args.limit]
+
+    for product in products:
         seen: dict[str, int] = {}
         for attempt in range(1, max_attempts + 1):
-            print(f"[{product['name']}] build attempt {attempt}/{max_attempts}")
+            progress(attempt, max_attempts, f"build {product['name']}")
+            print(f"  command: {product['build_command']}")
             cp = run_shell(product["build_command"], root)
             log_path = logs_dir / f"build.{product['name']}.attempt-{attempt}.log"
             write_text(log_path, cp.stdout)

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import pathlib
-import sys
 
-from common import append_jsonl, extract_json_objects, load_config, read_jsonl, rel, require_args, run, stable_id, write_text
+from common import append_jsonl, extract_json_objects, load_config, progress, read_jsonl, rel, run, stable_id, write_text
 
 
 def prompt_for(cfg: dict, mk_row: dict) -> str:
@@ -25,8 +25,29 @@ Products/configurations to preserve:
 Project root: `%s`
 Scan subdir: `%s`
 
-Follow necessary include files if they affect targets, conditions, sources,
-flags, or dependencies. Preserve conditional logic in the output JSON.
+Follow necessary include files only when they affect a real target defined by
+the primary file.
+
+If the primary file is only an include aggregator, for example:
+
+```make
+include $(LOCAL_PATH)/*/package.mk
+```
+
+do not expand the included package.mk files and do not duplicate child targets.
+Emit exactly one JSONL record with `"target_type": "include_aggregator"` and put
+the suggested CMake include/add_subdirectory entries in `cmake_includes`.
+
+Preserve conditional logic in the output JSON.
+
+If a condition adds sources, defines, include directories, compile options,
+link libraries, or link options, put the effect into the matching
+`conditional_*` field. Do not leave conditional behavior only as prose in
+`conditions`.
+
+If a switch variable is not defined in the current file or included files, keep
+using the variable anyway. The outer build/CMake project defines production
+switches. Do not report undefined production switch variables as risks.
 """ % (
         json.dumps(mk_row, ensure_ascii=False, indent=2),
         json.dumps(products, ensure_ascii=False, indent=2),
@@ -36,9 +57,15 @@ flags, or dependencies. Preserve conditional logic in the output JSON.
 
 
 def main() -> int:
-    cfg = load_config(require_args(sys.argv, "usage: analyze_mk_files.py <config.json>"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config")
+    parser.add_argument("--limit", type=int, default=0, help="maximum number of mk files to analyze")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
     state = pathlib.Path(cfg["state_dir"])
     mk_rows = read_jsonl(state / "mk_files.jsonl")
+    if args.limit > 0:
+        mk_rows = mk_rows[: args.limit]
     targets_path = state / "targets.jsonl"
     prompts_dir = state / "prompts"
     results_dir = state / "opencode_results"
@@ -46,7 +73,8 @@ def main() -> int:
     targets_path.unlink(missing_ok=True)
 
     all_targets = []
-    for mk_row in mk_rows:
+    for index, mk_row in enumerate(mk_rows, start=1):
+        progress(index, len(mk_rows), f"analyze {mk_row['path']}")
         prompt_path = prompts_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.md"
         result_path = results_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.out"
         stderr_path = logs_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.err"
@@ -67,6 +95,7 @@ def main() -> int:
         write_text(result_path, cp.stdout)
         write_text(stderr_path, cp.stderr)
         rows = extract_json_objects(cp.stdout)
+        print(f"  opencode returncode={cp.returncode}; extracted {len(rows)} target record(s)")
         for idx, row in enumerate(rows):
             row.setdefault("schema_version", 1)
             row.setdefault("source_mk", mk_row["path"])
@@ -92,4 +121,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
