@@ -22,6 +22,7 @@ def run_shell(command: str, cwd: pathlib.Path) -> subprocess.CompletedProcess[st
 
 def prompt_for(cfg: dict, product: dict, attempt: int, signature: str, excerpt: str, log_path: pathlib.Path) -> str:
     state = pathlib.Path(cfg["state_dir"])
+    layout = cfg.get("cmake_output_layout", "centralized")
     return """# Build Repair Task
 
 Product: `%s`
@@ -32,6 +33,7 @@ Build command:
 %s
 ```
 
+CMake output layout: `%s`
 CMake output directory: `%s`
 Analyzed target JSONL: `%s`
 Manual handoff file: `%s`
@@ -48,6 +50,7 @@ Make the smallest CMake edit that should advance the build. Do not run builds.
         attempt,
         signature,
         product["build_command"],
+        layout,
         cfg["cmake_output_dir"],
         rel(state / "targets.jsonl"),
         rel(state / "manual_required.md"),
@@ -152,4 +155,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

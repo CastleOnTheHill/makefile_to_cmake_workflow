@@ -1,6 +1,7 @@
 {
   "project_root": ".",
   "scan_subdir": "demo/cjson/src",
+  "cmake_output_layout": "centralized",
   "cmake_output_dir": "workflow_v2/out/cmake",
   "opencode_bin": ".tools/node_modules/.bin/opencode",
   "model": "deepseek/deepseek-v4-pro",
@@ -29,4 +30,3 @@
     }
   ]
 }
-

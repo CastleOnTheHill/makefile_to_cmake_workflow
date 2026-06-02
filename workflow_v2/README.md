@@ -19,6 +19,12 @@ Start by copying and editing:
 cp workflow_v2/config.example.json workflow_v2/config.local.json
 ```
 
+Choose an output layout:
+
+- `centralized`: write generated CMake under `cmake_output_dir`.
+- `beside_mk`: write `CMakeLists.txt` and `generated_targets.cmake` beside
+  each target's source Makefile/Android.mk/*.mk file.
+
 Then run:
 
 ```bash
