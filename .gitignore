@@ -24,6 +24,9 @@ demo/*/converted_artifacts.txt
 workflow/logs/
 workflow/opencode/
 workflow/manual_required.md
+workflow_v2/state/
+workflow_v2/out/
+workflow_v2/config.local.json
 
 # Python/cache/build noise
 __pycache__/
@@ -44,4 +47,3 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
-

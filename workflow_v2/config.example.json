@@ -1,0 +1,32 @@
+{
+  "project_root": ".",
+  "scan_subdir": "demo/cjson/src",
+  "cmake_output_dir": "workflow_v2/out/cmake",
+  "opencode_bin": ".tools/node_modules/.bin/opencode",
+  "model": "deepseek/deepseek-v4-pro",
+  "api_key_file": "mykey.txt",
+  "state_dir": "workflow_v2/state",
+  "max_fix_attempts_per_product": 8,
+  "max_same_failure": 3,
+  "error_excerpt_lines": 160,
+  "mk_file_patterns": [
+    "Android.mk",
+    "*.mk",
+    "Makefile"
+  ],
+  "ignore_dirs": [
+    ".git",
+    ".tools",
+    ".opencode/node_modules",
+    "demo/*/cmake-build",
+    "demo/*/original",
+    "demo/*/converted"
+  ],
+  "products": [
+    {
+      "name": "host-demo",
+      "build_command": "cmake -S workflow_v2/out/cmake -B workflow_v2/out/build/host-demo -G Ninja && cmake --build workflow_v2/out/build/host-demo -j 4"
+    }
+  ]
+}
+

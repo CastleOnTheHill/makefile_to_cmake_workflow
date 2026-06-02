@@ -9,6 +9,10 @@ The demo runs in two stages:
 1. `cjson`: small project, used to validate the full loop quickly.
 2. `libcurl`: larger project, used to exercise target/options/verification flow.
 
+`workflow_v2/` contains a newer multi-product workflow skeleton for complex
+Makefile/Android.mk projects. It splits analysis, CMake generation, and build
+repair into three OpenCode agents.
+
 The workflow keeps intermediate state under `workflow/` so it can be interrupted
 and resumed.
 
