@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import concurrent.futures
+import copy
 import json
 import pathlib
 import threading
@@ -64,9 +65,16 @@ def existing_child_cmake_lists(cfg: dict, target: dict, cmake_out: pathlib.Path)
     return rows
 
 
+def target_for_prompt(target: dict) -> dict:
+    prompt_target = copy.deepcopy(target)
+    prompt_target.pop("products", None)
+    return prompt_target
+
+
 def prompt_for(cfg: dict, target: dict, cmake_out: pathlib.Path) -> str:
     cmake_file = cmake_out / "CMakeLists.txt"
     child_cmake = existing_child_cmake_lists(cfg, target, cmake_out)
+    prompt_target = target_for_prompt(target)
     return """# CMake Conversion Task
 
 Convert this target JSON into CMake.
@@ -87,7 +95,13 @@ Target JSON:
 Requirements:
 
 - Add a trace comment with `workflow_v2:target_id=...`.
-- Preserve product conditions as real CMake `if(...)` logic.
+- Preserve Makefile/Android.mk switch conditions as real CMake `if(...)` logic.
+- Workflow config product names and build commands are not CMake conditions.
+  Do not generate `if(PRODUCT_NAME)` or product-name-gated `add_subdirectory()`
+  logic from workflow verification entries.
+- If an existing generated block is gated only by a workflow product-name
+  condition that is not present in the target JSON as a Makefile/Android.mk
+  switch, remove that gate and keep only the real mk-derived conditions.
 - Only edit files inside the CMake output directory.
 - Generate everything directly in `CMakeLists.txt`; do not create or include
   `generated_targets.cmake`.
@@ -112,7 +126,7 @@ Requirements:
         str(cmake_out),
         str(cmake_file),
         json.dumps(child_cmake, ensure_ascii=False, indent=2),
-        json.dumps(target, ensure_ascii=False, indent=2),
+        json.dumps(prompt_target, ensure_ascii=False, indent=2),
     )
 
 

@@ -45,8 +45,14 @@ Makefile、Android.mk 或 *.mk 文件。
   生成可读的 CMake 注释和保守的聚合入口，让人工或后续脚本补齐实际 include 列表。
 - 仍然必须写入 `workflow_v2:target_id=...` 追踪注释。
 
-当不同产品或 Makefile/Android.mk 开关存在条件差异时，必须生成实际 CMake 条件逻辑，
+当 Makefile/Android.mk 开关存在条件差异时，必须生成实际 CMake 条件逻辑，
 不能只把条件保留成注释。注释只能用于记录原始 mk 条件，不能替代实现。
+
+工作流配置中的产品名和 build command 只是外部验证入口，不是 CMake 条件。
+不要根据这类产品名生成 `if(PRODUCT_NAME)`，也不要生成按产品名 gated 的
+`add_subdirectory()`、`add_library()` 或 `add_executable()`。
+如果已有生成 block 只被这种工作流产品名条件包住，而该条件并不是 target JSON 中的
+Makefile/Android.mk 开关，则更新时要去掉这个产品名条件，只保留真实 mk 开关条件。
 
 直接使用根 CMake 工程已经定义好的开关：
 

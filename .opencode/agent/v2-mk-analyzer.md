@@ -15,6 +15,23 @@ tools:
 只有当 include 文件会影响当前文件中定义的真实构建目标时，才继续读取 include 文件。
 你必须记录所有实际依赖的 include 文件。
 
+如果主输入文件 A include 了 package.mk 文件 B，并且 A 和 B 共同决定同一个产物的源码、
+宏、include、编译选项、链接选项或依赖库，则必须把 B 当作 A 的组成部分分析，
+并把 B 写入 `included_mk`。不要为 B 单独输出重复 target；外部脚本会根据 `included_mk`
+和预扫描结果跳过后续对 B 的独立分析。
+
+如果遇到变量或条件 include，例如：
+
+```make
+-include $(project)/$(project/sub_type)/xxxx/package.mk
+```
+
+并且 prompt 中的 `Pre-scanned include candidate files` 列出了匹配到的候选
+`package.mk`，则这些候选代表不同产品、子类型或配置下可能被 include 的文件。
+你需要分别考虑这些候选文件对当前产物的影响：相同产物用 `conditions` 和
+`conditional_*` 表达差异，产物名称或类型不同才拆分 target。实际读取并影响当前产物的
+候选文件必须写入 `included_mk`。
+
 如果当前文件只是 include 聚合文件，例如主体只有：
 
 ```make
@@ -34,10 +51,9 @@ include $(LOCAL_PATH)/*/package.mk
   "schema_version": 1,
   "source_mk": "path of the primary input file",
   "included_mk": ["paths read because they affect this target"],
-  "target_id": "stable id: product/module/type or mk-relative-module",
+  "target_id": "stable id: mk-relative-module/type",
   "module": "original module/target name",
   "target_type": "shared_library|static_library|executable|gtest|prebuilt|include_aggregator|unknown",
-  "products": ["product names or condition labels where this target applies"],
   "conditions": [
     {
       "expression": "raw ifeq/ifneq/ifdef/ifndef or make condition",
@@ -88,9 +104,11 @@ include $(LOCAL_PATH)/*/package.mk
   生产构建系统会在外层定义这些变量；你只需要把变量名转换为 CMake 可直接使用的条件表达式。
 - 条件表达式转换规则要保守直接：`ifdef FOO` -> `FOO`，`ifndef FOO` -> `NOT FOO`，
   `ifeq ($(FOO),bar)` -> `FOO STREQUAL "bar"`，`ifneq ($(FOO),bar)` -> `NOT FOO STREQUAL "bar"`。
-- 如果多个产品影响同一个 module，且产物名称和目标类型相同，则输出一个 target，
-  并用 `products` 和 `conditions` 表达差异。
-- 如果不同产品会导致产物名称或目标类型不同，则拆成多个 target。
+- 工作流配置中的产品名和 build command 只是外部验证入口，不是 Makefile/CMake 条件。
+  不要因为外部产品名生成 target 条件，也不要输出这些产品名。
+- 如果 Makefile/Android.mk 自身的开关会影响同一个 module，且产物名称和目标类型相同，
+  则输出一个 target，并用 `conditions` 和 `conditional_*` 表达差异。
+- 如果 Makefile/Android.mk 自身的开关会导致产物名称或目标类型不同，则拆成多个 target。
 - 如果某个文件只定义复用变量，没有构建目标，则不输出任何 target 行，也不要额外解释。
 - 如果某个文件只是 include 聚合文件，则输出一个 `include_aggregator` 记录，不要展开
   include 并重复输出子目录中的真实 target。
