@@ -10,6 +10,9 @@
   "max_fix_attempts_per_product": 8,
   "max_same_failure": 3,
   "error_excerpt_lines": 160,
+  "opencode_timeout_seconds": 1800,
+  "analysis_opencode_timeout_seconds": 1800,
+  "conversion_opencode_timeout_seconds": 1800,
   "include_candidate_limit": 200,
   "mk_file_patterns": [
     "Android.mk",

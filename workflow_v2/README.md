@@ -53,8 +53,8 @@ conversion also accept `-j/--jobs` to run multiple OpenCode tasks in parallel:
 
 ```bash
 workflow_v2/scripts/run_all.py workflow_v2/config.local.json --limit 5 -j 3
-workflow_v2/scripts/analyze_mk_files.py workflow_v2/config.local.json --limit 20 -j 4
-workflow_v2/scripts/convert_targets.py workflow_v2/config.local.json --limit 20 -j 4
+workflow_v2/scripts/analyze_mk_files.py workflow_v2/config.local.json --limit 20 -j 4 --timeout 1800
+workflow_v2/scripts/convert_targets.py workflow_v2/config.local.json --limit 20 -j 4 --timeout 1800
 ```
 
 You can also bypass discovery and analyze a hand-picked file set:
@@ -77,6 +77,14 @@ Parallel analysis writes per-file prompt/stdout/stderr logs independently and
 merges `targets.jsonl` in the original mk file order. Parallel conversion
 serializes tasks that target the same `CMakeLists.txt`, so different
 directories can run concurrently while one directory remains safe.
+
+Analysis and conversion run in resumable mode by default. Existing successful
+OpenCode outputs are reused; missing, failed, or timed-out items are retried
+once in the next invocation. Use `--no-resume` to force reruns. Per-OpenCode
+timeouts default to `analysis_opencode_timeout_seconds` and
+`conversion_opencode_timeout_seconds`, falling back to `opencode_timeout_seconds`.
+When a timeout fires, the OpenCode process group is terminated and the workflow
+continues to the next item.
 
 Before analysis, the script pre-scans `include`, `-include`, and `sinclude`
 statements. If one primary package.mk file includes another package.mk file and
@@ -104,6 +112,10 @@ archived between experiments.
 - `state/skipped_mk_files.jsonl`: mk files skipped because another analyzed
   primary file includes them as part of the same artifact.
 - `state/targets.jsonl`: analyzed target records produced by `v2-mk-analyzer`.
+- `state/analysis_status.jsonl`: per-mk analysis attempt status, including
+  reused, failed, and timed-out runs.
+- `state/conversion_status.jsonl`: per-target conversion attempt status,
+  including reused, failed, and timed-out runs.
 - `state/build_state.jsonl`: build attempts and failure signatures.
 - `state/manual_required.md`: stalled failures that require human action.
 - `state/prompts/`: exact prompts sent to OpenCode.

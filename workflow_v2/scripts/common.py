@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -98,17 +99,50 @@ def shell_env(cfg: dict[str, Any]) -> dict[str, str]:
     return env
 
 
-def run(cmd: list[str], cfg: dict[str, Any], *, cwd: pathlib.Path | None = None, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+TIMEOUT_RETURNCODE = 124
+
+
+def run(
+    cmd: list[str],
+    cfg: dict[str, Any],
+    *,
+    cwd: pathlib.Path | None = None,
+    stdin: str | None = None,
+    timeout: int | float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd or ROOT),
         env=shell_env(cfg),
-        input=stdin,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
+        stdin=subprocess.PIPE if stdin is not None else None,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+        timeout_msg = f"\n[TIMEOUT] command exceeded timeout_seconds={timeout}; process group was terminated.\n"
+        return subprocess.CompletedProcess(
+            cmd,
+            TIMEOUT_RETURNCODE,
+            stdout or "",
+            (stderr or "") + timeout_msg,
+        )
 
 
 def extract_json_objects(text: str) -> list[dict[str, Any]]:

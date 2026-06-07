@@ -6,7 +6,7 @@ import json
 import pathlib
 import threading
 
-from common import load_config, progress, read_jsonl, rel, run, write_text
+from common import TIMEOUT_RETURNCODE, append_jsonl, load_config, now, progress, read_jsonl, rel, run, write_text
 
 
 def output_layout(cfg: dict) -> str:
@@ -69,6 +69,39 @@ def target_for_prompt(target: dict) -> dict:
     prompt_target = copy.deepcopy(target)
     prompt_target.pop("products", None)
     return prompt_target
+
+
+def latest_status_by_key(path: pathlib.Path, key: str) -> dict[str, dict]:
+    latest = {}
+    for row in read_jsonl(path):
+        value = row.get(key)
+        if value:
+            latest[value] = row
+    return latest
+
+
+def cmake_has_trace(cmake_out: pathlib.Path, target_id: str) -> bool:
+    cmake_file = cmake_out / "CMakeLists.txt"
+    if not cmake_file.exists():
+        return False
+    text = cmake_file.read_text(errors="replace")
+    return f"workflow_v2:target_id={target_id}" in text
+
+
+def should_reuse_conversion(
+    target_id: str,
+    cmake_out: pathlib.Path,
+    latest_status: dict | None,
+    result_path: pathlib.Path,
+    resume: bool,
+) -> bool:
+    if not resume:
+        return False
+    if latest_status and latest_status.get("status") == "done":
+        return True
+    if result_path.exists() and cmake_has_trace(cmake_out, target_id):
+        return True
+    return False
 
 
 def prompt_for(cfg: dict, target: dict, cmake_out: pathlib.Path) -> str:
@@ -140,7 +173,10 @@ def convert_one(
     logs_dir: pathlib.Path,
     locks: dict[pathlib.Path, threading.Lock],
     locks_guard: threading.Lock,
-) -> tuple[str, int, str]:
+    latest_status: dict | None,
+    timeout: int | None,
+    resume: bool,
+) -> tuple[str, int, dict, str]:
     target_id = target["target_id"]
     cmake_out = cmake_output_for_target(cfg, target)
     cmake_key = cmake_out.resolve()
@@ -150,10 +186,24 @@ def convert_one(
     # OpenCode edits CMakeLists.txt. Serialize tasks that target the same file.
     with lock:
         ensure_cmake_dir(cmake_out)
-        progress(index, total, f"convert {target_id} -> {rel(cmake_out)}")
         prompt_path = prompts_dir / f"{target_id}.v2-cmake-converter.md"
         result_path = results_dir / f"{target_id}.v2-cmake-converter.out"
         stderr_path = logs_dir / f"{target_id}.v2-cmake-converter.err"
+        if should_reuse_conversion(target_id, cmake_out, latest_status, result_path, resume):
+            status_row = {
+                "target_id": target_id,
+                "status": "done",
+                "returncode": 0,
+                "reused": True,
+                "time": now(),
+                "cmake_dir": rel(cmake_out),
+                "stdout_log": rel(result_path),
+                "stderr_log": rel(stderr_path),
+            }
+            message = f"{target_id}: reused existing conversion cmake_dir={rel(cmake_out)}"
+            return target_id, 0, status_row, message
+
+        progress(index, total, f"convert {target_id} -> {rel(cmake_out)}")
         write_text(prompt_path, prompt_for(cfg, target, cmake_out))
         cmd = [
             cfg["opencode_bin"],
@@ -167,14 +217,26 @@ def convert_one(
             "--",
             "Generate or update the CMake files for this target.",
         ]
-        cp = run(cmd, cfg)
+        cp = run(cmd, cfg, timeout=timeout)
         write_text(result_path, cp.stdout)
         write_text(stderr_path, cp.stderr)
+    status = "timeout" if cp.returncode == TIMEOUT_RETURNCODE else "failed" if cp.returncode != 0 else "done"
+    status_row = {
+        "target_id": target_id,
+        "status": status,
+        "returncode": cp.returncode,
+        "reused": False,
+        "time": now(),
+        "timeout_seconds": timeout,
+        "cmake_dir": rel(cmake_out),
+        "stdout_log": rel(result_path),
+        "stderr_log": rel(stderr_path),
+    }
     message = (
         f"{target_id}: layout={output_layout(cfg)} cmake_dir={rel(cmake_out)} "
         f"returncode={cp.returncode} result={rel(result_path)}"
     )
-    return target_id, cp.returncode, message
+    return target_id, cp.returncode, status_row, message
 
 
 def main() -> int:
@@ -182,10 +244,19 @@ def main() -> int:
     parser.add_argument("config")
     parser.add_argument("--limit", type=int, default=0, help="maximum number of targets to convert")
     parser.add_argument("-j", "--jobs", type=int, default=1, help="parallel OpenCode conversion jobs")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help="per-OpenCode conversion timeout in seconds; defaults to conversion_opencode_timeout_seconds or opencode_timeout_seconds from config",
+    )
+    parser.add_argument("--no-resume", action="store_true", help="rerun every conversion task instead of reusing existing successful results")
     args = parser.parse_args()
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
     cfg = load_config(args.config)
+    timeout = args.timeout or int(cfg.get("conversion_opencode_timeout_seconds", cfg.get("opencode_timeout_seconds", 1800)))
+    resume = not args.no_resume
     state = pathlib.Path(cfg["state_dir"])
     targets = read_jsonl(state / "targets.jsonl")
     if args.limit > 0:
@@ -193,8 +264,10 @@ def main() -> int:
     prompts_dir = state / "prompts"
     results_dir = state / "opencode_results"
     logs_dir = state / "logs"
+    status_path = state / "conversion_status.jsonl"
+    latest_status = latest_status_by_key(status_path, "target_id")
 
-    print(f"converting {len(targets)} target(s) with jobs={args.jobs}")
+    print(f"converting {len(targets)} target(s) with jobs={args.jobs}; timeout={timeout}s; resume={resume}")
     locks: dict[pathlib.Path, threading.Lock] = {}
     locks_guard = threading.Lock()
     failures = 0
@@ -211,11 +284,15 @@ def main() -> int:
                 logs_dir,
                 locks,
                 locks_guard,
+                latest_status.get(target["target_id"]),
+                timeout,
+                resume,
             )
             for index, target in enumerate(targets, start=1)
         ]
         for future in concurrent.futures.as_completed(futures):
-            _, returncode, message = future.result()
+            _, returncode, status_row, message = future.result()
+            append_jsonl(status_path, status_row)
             print(message)
             if returncode != 0:
                 failures += 1

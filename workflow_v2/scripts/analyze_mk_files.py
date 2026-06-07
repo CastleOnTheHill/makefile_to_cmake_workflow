@@ -6,7 +6,7 @@ import json
 import pathlib
 import re
 
-from common import append_jsonl, extract_json_objects, load_config, progress, read_jsonl, rel, run, stable_id, write_jsonl, write_text
+from common import TIMEOUT_RETURNCODE, append_jsonl, extract_json_objects, load_config, now, progress, read_jsonl, rel, run, stable_id, write_jsonl, write_text
 
 
 INCLUDE_RE = re.compile(r"^\s*-?\s*(?:include|sinclude)\s+(.+?)\s*$")
@@ -316,6 +316,64 @@ def load_mk_rows(cfg: dict, state: pathlib.Path, args: argparse.Namespace) -> li
     return read_jsonl(state / "mk_files.jsonl")
 
 
+def latest_status_by_key(path: pathlib.Path, key: str) -> dict[str, dict]:
+    latest = {}
+    for row in read_jsonl(path):
+        value = row.get(key)
+        if value:
+            latest[value] = row
+    return latest
+
+
+def merge_legacy_analysis_failures(latest: dict[str, dict], failure_path: pathlib.Path) -> dict[str, dict]:
+    for row in read_jsonl(failure_path):
+        mk_id = row.get("mk_id")
+        if mk_id and mk_id not in latest:
+            latest[mk_id] = {
+                "mk_id": mk_id,
+                "path": row.get("path"),
+                "status": row.get("status", "failed"),
+                "returncode": row.get("returncode", 1),
+            }
+    return latest
+
+
+def normalize_rows(mk_row: dict, rows: list[dict]) -> list[dict]:
+    normalized = []
+    for idx, row in enumerate(rows):
+        row.setdefault("schema_version", 1)
+        row.setdefault("source_mk", mk_row["path"])
+        row.setdefault("target_id", stable_id(f"{mk_row['path']}:{row.get('module', idx)}"))
+        row["_analysis_source"] = mk_row["path"]
+        normalized.append(row)
+    return normalized
+
+
+def rows_from_existing_result(mk_row: dict, result_path: pathlib.Path) -> list[dict]:
+    if not result_path.exists():
+        return []
+    return normalize_rows(mk_row, extract_json_objects(result_path.read_text(errors="replace")))
+
+
+def should_reuse_analysis(
+    mk_row: dict,
+    latest_status: dict | None,
+    result_path: pathlib.Path,
+    stderr_path: pathlib.Path,
+    resume: bool,
+) -> bool:
+    if not resume or not result_path.exists():
+        return False
+    if latest_status:
+        return latest_status.get("status") in {"done", "empty"}
+    rows = extract_json_objects(result_path.read_text(errors="replace"))
+    if rows:
+        return True
+    if stderr_path.exists() and not stderr_path.read_text(errors="replace").strip():
+        return True
+    return False
+
+
 def analyze_one(
     cfg: dict,
     mk_row: dict,
@@ -324,11 +382,31 @@ def analyze_one(
     prompts_dir: pathlib.Path,
     results_dir: pathlib.Path,
     logs_dir: pathlib.Path,
-) -> tuple[int, list[dict], dict | None, str]:
-    progress(index, total, f"analyze {mk_row['path']}")
+    latest_status: dict | None,
+    timeout: int | None,
+    resume: bool,
+) -> tuple[int, list[dict], dict | None, dict, str]:
     prompt_path = prompts_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.md"
     result_path = results_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.out"
     stderr_path = logs_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.err"
+    if should_reuse_analysis(mk_row, latest_status, result_path, stderr_path, resume):
+        rows = rows_from_existing_result(mk_row, result_path)
+        status = "done" if rows else "empty"
+        status_row = {
+            "mk_id": mk_row["mk_id"],
+            "path": mk_row["path"],
+            "status": status,
+            "returncode": 0,
+            "rows": len(rows),
+            "reused": True,
+            "time": now(),
+            "stdout_log": rel(result_path),
+            "stderr_log": rel(stderr_path),
+        }
+        message = f"{mk_row['path']}: reused existing result; extracted {len(rows)} target record(s)"
+        return index, rows, None, status_row, message
+
+    progress(index, total, f"analyze {mk_row['path']}")
     write_text(prompt_path, prompt_for(cfg, mk_row))
     cmd = [
         cfg["opencode_bin"],
@@ -342,31 +420,38 @@ def analyze_one(
         "--",
         "Analyze this Makefile/Android.mk file and output JSONL only.",
     ]
-    cp = run(cmd, cfg)
+    cp = run(cmd, cfg, timeout=timeout)
     write_text(result_path, cp.stdout)
     write_text(stderr_path, cp.stderr)
-    rows = extract_json_objects(cp.stdout)
-    normalized = []
-    for idx, row in enumerate(rows):
-        row.setdefault("schema_version", 1)
-        row.setdefault("source_mk", mk_row["path"])
-        row.setdefault("target_id", stable_id(f"{mk_row['path']}:{row.get('module', idx)}"))
-        row["_analysis_source"] = mk_row["path"]
-        normalized.append(row)
+    normalized = normalize_rows(mk_row, extract_json_objects(cp.stdout))
     failure = None
     if cp.returncode != 0:
         failure = {
             "mk_id": mk_row["mk_id"],
             "path": mk_row["path"],
             "returncode": cp.returncode,
+            "status": "timeout" if cp.returncode == TIMEOUT_RETURNCODE else "failed",
             "stderr_log": rel(stderr_path),
             "stdout_log": rel(result_path),
         }
+    status = "timeout" if cp.returncode == TIMEOUT_RETURNCODE else "failed" if cp.returncode != 0 else "done" if normalized else "empty"
+    status_row = {
+        "mk_id": mk_row["mk_id"],
+        "path": mk_row["path"],
+        "status": status,
+        "returncode": cp.returncode,
+        "rows": len(normalized),
+        "reused": False,
+        "time": now(),
+        "timeout_seconds": timeout,
+        "stdout_log": rel(result_path),
+        "stderr_log": rel(stderr_path),
+    }
     message = (
         f"{mk_row['path']}: returncode={cp.returncode}; "
         f"extracted {len(normalized)} target record(s)"
     )
-    return index, normalized, failure, message
+    return index, normalized, failure, status_row, message
 
 
 def main() -> int:
@@ -387,10 +472,19 @@ def main() -> int:
         help="text file containing Makefile/Android.mk/*.mk paths, one per line; repeatable",
     )
     parser.add_argument("-j", "--jobs", type=int, default=1, help="parallel OpenCode analysis jobs")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help="per-OpenCode analysis timeout in seconds; defaults to analysis_opencode_timeout_seconds or opencode_timeout_seconds from config",
+    )
+    parser.add_argument("--no-resume", action="store_true", help="rerun every analysis task instead of reusing existing successful results")
     args = parser.parse_args()
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
     cfg = load_config(args.config)
+    timeout = args.timeout or int(cfg.get("analysis_opencode_timeout_seconds", cfg.get("opencode_timeout_seconds", 1800)))
+    resume = not args.no_resume
     state = pathlib.Path(cfg["state_dir"])
     mk_rows, skipped_rows = enrich_and_filter_mk_rows(cfg, load_mk_rows(cfg, state, args))
     if args.limit > 0:
@@ -398,13 +492,21 @@ def main() -> int:
     write_jsonl(state / "analyze_inputs.jsonl", mk_rows)
     write_jsonl(state / "skipped_mk_files.jsonl", skipped_rows)
     targets_path = state / "targets.jsonl"
+    status_path = state / "analysis_status.jsonl"
+    latest_status = merge_legacy_analysis_failures(
+        latest_status_by_key(status_path, "mk_id"),
+        state / "analysis_failures.jsonl",
+    )
     prompts_dir = state / "prompts"
     results_dir = state / "opencode_results"
     logs_dir = state / "logs"
     targets_path.unlink(missing_ok=True)
 
-    print(f"analyzing {len(mk_rows)} mk file(s) with jobs={args.jobs}; skipped {len(skipped_rows)} covered include file(s)")
-    results: dict[int, tuple[list[dict], dict | None, str]] = {}
+    print(
+        f"analyzing {len(mk_rows)} mk file(s) with jobs={args.jobs}; "
+        f"timeout={timeout}s; resume={resume}; skipped {len(skipped_rows)} covered include file(s)"
+    )
+    results: dict[int, tuple[list[dict], dict | None, dict, str]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         futures = [
             executor.submit(
@@ -416,18 +518,22 @@ def main() -> int:
                 prompts_dir,
                 results_dir,
                 logs_dir,
+                latest_status.get(mk_row["mk_id"]),
+                timeout,
+                resume,
             )
             for index, mk_row in enumerate(mk_rows, start=1)
         ]
         for future in concurrent.futures.as_completed(futures):
-            index, rows, failure, message = future.result()
-            results[index] = (rows, failure, message)
+            index, rows, failure, status_row, message = future.result()
+            results[index] = (rows, failure, status_row, message)
             print(message)
 
     all_targets = []
     failures = 0
     for index in sorted(results):
-        rows, failure, _ = results[index]
+        rows, failure, status_row, _ = results[index]
+        append_jsonl(status_path, status_row)
         for row in rows:
             append_jsonl(targets_path, row)
             all_targets.append(row)
