@@ -154,6 +154,21 @@ Requirements:
   production switches.
 - If generating `add_subdirectory(child)`, only use child directories listed in
   `Existing direct child directories that already contain CMakeLists.txt`.
+- Do not pass unexpanded wildcards or Makefile expressions to CMake target
+  commands. Never generate `target_sources(lib PRIVATE src/*.cpp)`,
+  `add_library(lib src/*.c)`, or `add_executable(app foo/**/*.cc)`: CMake does
+  not expand `*`, `?`, `[]`, or `**` in these commands.
+- Prefer explicit source file lists. If the target JSON still contains source
+  wildcards, expand them against the repository/source_mk directory when the
+  concrete files are known. Only as a last resort, use
+  `file(GLOB CONFIGURE_DEPENDS <var> <pattern>...)` and then pass `${<var>}` to
+  `target_sources`, with a comment naming the original Makefile wildcard.
+- Do not put wildcard paths in `target_include_directories`; include dirs must
+  be concrete directories.
+- Do not put wildcard library names such as `lib*.a`, `*.so`, or `-lfoo*` in
+  `target_link_libraries`; link items must be concrete targets or libraries.
+- Do not put directories, unresolved Makefile variables, `$(call ...)`
+  expressions, or missing generated files into `target_sources`.
 """ % (
         output_layout(cfg),
         str(cmake_out),

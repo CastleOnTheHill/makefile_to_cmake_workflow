@@ -75,6 +75,13 @@ link libraries, or link options, put the effect into the matching
 `conditional_*` field. Do not leave conditional behavior only as prose in
 `conditions`.
 
+Resolve Makefile source wildcards and source collection functions when possible.
+For example, `src/*.cpp`, `$(wildcard ...)`, `$(call all-c-files-under,...)`,
+and `$(call all-cpp-files-under,...)` should become concrete file lists in
+`sources` or `conditional_sources` when the repository tree makes that possible.
+If the concrete file list cannot be determined statically, do not invent files;
+record the original expression and uncertainty in `risks`.
+
 If a switch variable is not defined in the current file or included files, keep
 using the variable anyway. The outer build/CMake project defines production
 switches. Do not report undefined production switch variables as risks.

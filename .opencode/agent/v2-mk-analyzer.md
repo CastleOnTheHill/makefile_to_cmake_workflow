@@ -115,5 +115,11 @@ include $(LOCAL_PATH)/*/package.mk
 - `include_aggregator` 记录中，`module` 使用当前 mk 文件名或目录名，`sources` 等编译字段
   使用空数组，原始 include 表达式写入 `conditions` 或 `risks`，建议的 CMake 聚合项写入
   `cmake_includes`。
+- 源文件事实必须尽量具体化。遇到 Makefile/Android.mk 中的通配符或源文件收集函数，
+  例如 `src/*.cpp`、`$(wildcard ...)`、`$(call all-c-files-under,...)`、
+  `$(call all-cpp-files-under,...)`，如果能从仓库文件树确认实际文件，必须在
+  `sources` 或 `conditional_sources` 中输出具体文件列表，不要只输出未展开的通配模式。
+- 如果通配符、变量展开或生成源码规则无法静态确认，不能编造文件名；把原始表达式和原因写入
+  `risks`，并在 `generated_sources` 或对应字段中保留可追踪事实。
 - 缺失的可选字段使用空数组或空字符串。
 - 不要编造路径、库名或条件。无法确定的信息写入 `risks`。

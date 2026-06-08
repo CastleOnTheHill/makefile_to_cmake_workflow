@@ -83,4 +83,27 @@ endif()
 等价 CMake 逻辑实现，不能只写注释。受条件影响的 CMake 逻辑旁边必须保留原始
 Makefile/Android.mk 条件表达式注释，方便人工审查。
 
+CMake 生成时必须避免未展开通配符和非文件输入：
+
+- 绝对不要生成 `target_sources(lib PRIVATE src/*.cpp)`、`add_library(lib src/*.c)`、
+  `add_executable(app foo/**/*.cc)` 这类写法。CMake 不会在这些命令中自动展开
+  `*`、`?`、`[]` 或 `**`，最终会得不到实际源文件或配置失败。
+- 优先把 `sources`、`generated_sources`、`conditional_sources` 展开为明确的文件清单，
+  再传给 `add_library`、`add_executable` 或 `target_sources`。
+- 如果输入 JSON 仍然包含通配模式，先尝试根据 `source_mk` 所在目录和已知仓库文件树
+  展开成具体文件。只有在无法确认具体文件且必须保留动态行为时，才可以使用
+  `file(GLOB CONFIGURE_DEPENDS <var> <pattern>...)`，随后用 `${<var>}` 传给
+  `target_sources`，并用注释标明这是无法静态展开的 Makefile 通配来源。
+- 不要把目录当作源文件传给 `target_sources`；目录只能作为 include dir、
+  `add_subdirectory` 或自定义生成规则的一部分。
+- 不要在 `target_include_directories` 中写 `include/*`、`*/include` 等通配路径；
+  include 目录必须是具体目录。无法展开时记录注释或风险，不要伪造。
+- 不要在 `target_link_libraries` 中写 `lib*.a`、`*.so`、`-lfoo*` 等通配库名。
+  链接项必须是具体 target、具体库文件或具体 `-lxxx` 名称。
+- 不要把 Makefile 变量表达式原样写成源文件，例如 `$(LOCAL_PATH)/foo.c`、
+  `$(call ...)`、`${some_make_var}`。能解析则转换成 CMake 相对/绝对路径；
+  不能解析则不要放入 `target_sources`。
+- 对生成源码或生成头文件，不要把尚不存在的输出文件当普通源码静默加入；需要有
+  `add_custom_command(OUTPUT ...)`、`add_custom_target` 或已有生成规则可追踪。
+
 最后返回简洁的 Markdown 总结，说明修改了哪些文件，以及还存在哪些未解决风险。
