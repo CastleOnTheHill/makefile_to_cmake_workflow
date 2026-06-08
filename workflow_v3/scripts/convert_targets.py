@@ -264,7 +264,6 @@ def convert_one(
     with lock:
         ensure_cmake_file(cmake_file)
         prompt = write_temp_prompt(cfg, task_id, prompt_for(cfg, row, targets, row.get(COL_MANUAL_COMMENT, "")))
-        progress(index, total, f"convert {mk_path} -> {rel(cmake_file)}")
         try:
             cmd = [
                 cfg["opencode_bin"],
@@ -372,6 +371,7 @@ def main() -> int:
         return 0
 
     failures = 0
+    completed = 0
     locks: dict[pathlib.Path, threading.Lock] = {}
     locks_guard = threading.Lock()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
@@ -382,6 +382,8 @@ def main() -> int:
         for future in concurrent.futures.as_completed(futures):
             status_row = future.result()
             update_board_row(cfg, status_row)
+            completed += 1
+            progress(completed, len(tasks), f"saved conversion {status_row['mk_path']}")
             print(status_row["message"], flush=True)
             if status_row["status"] not in {"done", "no_targets"}:
                 failures += 1

@@ -202,7 +202,6 @@ def analyze_one(cfg: dict, row: dict[str, str], index: int, total: int, timeout:
     stdout_path = log_path(cfg, f"{task_id}.analysis", "out")
     stderr_path = log_path(cfg, f"{task_id}.analysis", "err")
     prompt = write_temp_prompt(cfg, task_id, prompt_for(cfg, row))
-    progress(index, total, f"analyze {mk_path}")
     try:
         cmd = [
             cfg["opencode_bin"],
@@ -308,6 +307,7 @@ def main() -> int:
         return 0
 
     failures = 0
+    completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         futures = [
             executor.submit(analyze_one, cfg, row, index, len(tasks), timeout)
@@ -316,6 +316,8 @@ def main() -> int:
         for future in concurrent.futures.as_completed(futures):
             status_row = future.result()
             update_board_row(cfg, status_row)
+            completed += 1
+            progress(completed, len(tasks), f"saved analysis {status_row['mk_path']}")
             print(status_row["message"], flush=True)
             if status_row["status"] not in {"done", "empty"}:
                 failures += 1
