@@ -7,6 +7,7 @@ import pathlib
 import threading
 
 from common import TIMEOUT_RETURNCODE, append_jsonl, load_config, now, progress, read_jsonl, rel, run, write_text
+from task_board import get_item, load_board, save_board, upsert_item
 
 
 def output_layout(cfg: dict) -> str:
@@ -88,15 +89,77 @@ def cmake_has_trace(cmake_out: pathlib.Path, target_id: str) -> bool:
     return f"workflow_v2:target_id={target_id}" in text
 
 
+def seed_conversion_board(
+    cfg: dict,
+    board: dict,
+    targets: list[dict],
+    latest_status: dict[str, dict],
+    results_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+) -> None:
+    for index, target in enumerate(targets, start=1):
+        target_id = target["target_id"]
+        cmake_out = cmake_output_for_target(cfg, target)
+        result_path = results_dir / f"{target_id}.v2-cmake-converter.out"
+        stderr_path = logs_dir / f"{target_id}.v2-cmake-converter.err"
+        source_mk = target.get("source_mk") or target.get("_analysis_source")
+        fields = {
+            "module": target.get("module"),
+            "source_mk": source_mk,
+            "target_type": target.get("target_type"),
+            "order": index,
+            "cmake_dir": rel(cmake_out),
+            "stdout_log": rel(result_path),
+            "stderr_log": rel(stderr_path),
+        }
+        item = get_item(board, "conversion", target_id)
+        if item is None:
+            legacy = latest_status.get(target_id, {})
+            status = legacy.get("status", "pending")
+            if status == "done" and not cmake_has_trace(cmake_out, target_id):
+                status = "pending"
+            fields.update(
+                {
+                    "status": status,
+                    "returncode": legacy.get("returncode"),
+                }
+            )
+            upsert_item(board, "conversion", target_id, **fields)
+        else:
+            upsert_item(board, "conversion", target_id, touch=False, **fields)
+
+
+def update_conversion_board(board: dict, status_row: dict) -> None:
+    existing = get_item(board, "conversion", status_row["target_id"]) or {}
+    fields = {
+        "status": status_row.get("status"),
+        "returncode": status_row.get("returncode"),
+        "reused": status_row.get("reused"),
+        "timeout_seconds": status_row.get("timeout_seconds"),
+        "cmake_dir": status_row.get("cmake_dir"),
+        "stdout_log": status_row.get("stdout_log"),
+        "stderr_log": status_row.get("stderr_log"),
+    }
+    if existing.get("status") == "manual_issue" and status_row.get("status") == "done":
+        fields["manual_issue_resolved_at"] = now()
+    upsert_item(board, "conversion", status_row["target_id"], **fields)
+
+
 def should_reuse_conversion(
     target_id: str,
     cmake_out: pathlib.Path,
+    board_item: dict | None,
     latest_status: dict | None,
     result_path: pathlib.Path,
     resume: bool,
 ) -> bool:
     if not resume:
         return False
+    if board_item:
+        status = board_item.get("status")
+        if status == "manual_issue":
+            return False
+        return status == "done" and cmake_has_trace(cmake_out, target_id)
     if latest_status and latest_status.get("status") == "done":
         return True
     if result_path.exists() and cmake_has_trace(cmake_out, target_id):
@@ -104,10 +167,20 @@ def should_reuse_conversion(
     return False
 
 
-def prompt_for(cfg: dict, target: dict, cmake_out: pathlib.Path) -> str:
+def prompt_for(cfg: dict, target: dict, cmake_out: pathlib.Path, manual_comment: str = "") -> str:
     cmake_file = cmake_out / "CMakeLists.txt"
     child_cmake = existing_child_cmake_lists(cfg, target, cmake_out)
     prompt_target = target_for_prompt(target)
+    manual_comment_section = ""
+    if manual_comment.strip():
+        manual_comment_section = """
+Manual board comment for this target:
+```text
+%s
+```
+Address this comment in the generated CMake. Treat it as human review feedback
+for a previous conversion attempt.
+""" % manual_comment.strip()
     return """# CMake Conversion Task
 
 Convert this target JSON into CMake.
@@ -124,6 +197,7 @@ Target JSON:
 ```json
 %s
 ```
+%s
 
 Requirements:
 
@@ -175,6 +249,7 @@ Requirements:
         str(cmake_file),
         json.dumps(child_cmake, ensure_ascii=False, indent=2),
         json.dumps(prompt_target, ensure_ascii=False, indent=2),
+        manual_comment_section,
     )
 
 
@@ -188,6 +263,7 @@ def convert_one(
     logs_dir: pathlib.Path,
     locks: dict[pathlib.Path, threading.Lock],
     locks_guard: threading.Lock,
+    board_item: dict | None,
     latest_status: dict | None,
     timeout: int | None,
     resume: bool,
@@ -204,7 +280,7 @@ def convert_one(
         prompt_path = prompts_dir / f"{target_id}.v2-cmake-converter.md"
         result_path = results_dir / f"{target_id}.v2-cmake-converter.out"
         stderr_path = logs_dir / f"{target_id}.v2-cmake-converter.err"
-        if should_reuse_conversion(target_id, cmake_out, latest_status, result_path, resume):
+        if should_reuse_conversion(target_id, cmake_out, board_item, latest_status, result_path, resume):
             status_row = {
                 "target_id": target_id,
                 "status": "done",
@@ -219,7 +295,8 @@ def convert_one(
             return target_id, 0, status_row, message
 
         progress(index, total, f"convert {target_id} -> {rel(cmake_out)}")
-        write_text(prompt_path, prompt_for(cfg, target, cmake_out))
+        manual_comment = (board_item or {}).get("manual_comment", "")
+        write_text(prompt_path, prompt_for(cfg, target, cmake_out, manual_comment))
         cmd = [
             cfg["opencode_bin"],
             "run",
@@ -281,8 +358,14 @@ def main() -> int:
     logs_dir = state / "logs"
     status_path = state / "conversion_status.jsonl"
     latest_status = latest_status_by_key(status_path, "target_id")
+    board = load_board(cfg)
+    seed_conversion_board(cfg, board, targets, latest_status, results_dir, logs_dir)
+    board_path = save_board(cfg, board)
 
-    print(f"converting {len(targets)} target(s) with jobs={args.jobs}; timeout={timeout}s; resume={resume}")
+    print(
+        f"converting {len(targets)} target(s) with jobs={args.jobs}; "
+        f"timeout={timeout}s; resume={resume}; board={rel(board_path)}"
+    )
     locks: dict[pathlib.Path, threading.Lock] = {}
     locks_guard = threading.Lock()
     failures = 0
@@ -299,6 +382,7 @@ def main() -> int:
                 logs_dir,
                 locks,
                 locks_guard,
+                get_item(board, "conversion", target["target_id"]),
                 latest_status.get(target["target_id"]),
                 timeout,
                 resume,
@@ -308,6 +392,8 @@ def main() -> int:
         for future in concurrent.futures.as_completed(futures):
             _, returncode, status_row, message = future.result()
             append_jsonl(status_path, status_row)
+            update_conversion_board(board, status_row)
+            save_board(cfg, board)
             print(message)
             if returncode != 0:
                 failures += 1

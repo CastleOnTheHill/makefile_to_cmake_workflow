@@ -7,6 +7,7 @@
   "model": "deepseek/deepseek-v4-pro",
   "api_key_file": "mykey.txt",
   "state_dir": "workflow_v2/state",
+  "task_board_path": "workflow_v2/state/task_board.md",
   "max_fix_attempts_per_product": 8,
   "max_same_failure": 3,
   "error_excerpt_lines": 160,
@@ -15,7 +16,6 @@
   "conversion_opencode_timeout_seconds": 1800,
   "include_prescan_enabled": true,
   "include_candidate_limit": 200,
-  "include_transitive_depth": 2,
   "mk_file_patterns": [
     "Android.mk",
     "*.mk",

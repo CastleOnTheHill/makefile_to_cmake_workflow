@@ -7,20 +7,11 @@ import pathlib
 import re
 
 from common import TIMEOUT_RETURNCODE, append_jsonl, extract_json_objects, load_config, now, progress, read_jsonl, rel, run, stable_id, write_jsonl, write_text
+from task_board import get_item, load_board, save_board, upsert_item
 
 
 INCLUDE_RE = re.compile(r"^\s*(?:-|s)?include\s+(.+?)\s*$")
 MAKE_VAR_RE = re.compile(r"\$\(([^)]+)\)")
-TARGET_CUES = (
-    "LOCAL_MODULE",
-    "BUILD_SHARED_LIBRARY",
-    "BUILD_STATIC_LIBRARY",
-    "BUILD_EXECUTABLE",
-    "BUILD_NATIVE_TEST",
-    "BUILD_PACKAGE",
-    "add_library",
-    "add_executable",
-)
 
 
 def prompt_for(cfg: dict, mk_row: dict) -> str:
@@ -43,13 +34,14 @@ Pre-scanned include candidate files:
 
 If `include` or `-include` uses variables or wildcards and the pre-scanned
 candidate list contains matching `package.mk` files, consider those candidates
-as product/configuration variants of the current primary file. Read the
-candidate files that jointly decide this primary file's build target, and put
-them in `included_mk`.
+as possible product/configuration variants of the current primary file. Read a
+candidate file only when it is necessary to understand the current primary file,
+and put files that actually affect this primary file's target in `included_mk`.
 
-If the primary file A and an included package.mk file B jointly decide one
-artifact, output the artifact only once as A's target and list B in
-`included_mk`. Do not output a duplicate standalone target for B.
+Every discovered Makefile/Android.mk/*.mk file is analyzed independently by the
+workflow. Do not suppress the current primary file just because it may be
+included by another file, and do not rely on `included_mk` to deduplicate later
+analysis tasks.
 
 Workflow config `products` are only build verification entries. They are not
 Makefile/CMake conditions. Do not infer target enablement, source selection, or
@@ -142,29 +134,6 @@ def include_tokens(text: str) -> list[str]:
             if token:
                 tokens.append(token)
     return tokens
-
-
-def file_has_target_cues(text: str) -> bool:
-    return any(cue in text for cue in TARGET_CUES)
-
-
-def is_include_only_aggregator(text: str) -> bool:
-    meaningful = []
-    for raw in text.splitlines():
-        line = strip_make_comment(raw).strip()
-        if line:
-            meaningful.append(line)
-    if not meaningful:
-        return False
-    def include_or_assignment(line: str) -> bool:
-        return bool(
-            INCLUDE_RE.match(line)
-        or ":=" in line
-        or "+=" in line
-        or "?=" in line
-        or "=" in line
-        )
-    return not file_has_target_cues(text) and all(include_or_assignment(line) for line in meaningful)
 
 
 def fixed_suffix_after_last_make_var(token: str) -> str:
@@ -269,9 +238,9 @@ def resolve_include_token(cfg: dict, mk_path: pathlib.Path, token: str) -> list[
     return result
 
 
-def scan_include_candidates(cfg: dict, mk_row: dict) -> tuple[list[dict], bool]:
+def scan_include_candidates(cfg: dict, mk_row: dict) -> list[dict]:
     if not cfg.get("include_prescan_enabled", True):
-        return [], False
+        return []
     cache = cfg.setdefault("_include_scan_cache", {})
     cache_key = mk_row["path"]
     if cache_key in cache:
@@ -280,9 +249,8 @@ def scan_include_candidates(cfg: dict, mk_row: dict) -> tuple[list[dict], bool]:
     root = pathlib.Path(cfg["project_root"])
     mk_path = root / mk_row["path"]
     if not mk_path.exists():
-        result = ([], False)
-        cache[cache_key] = result
-        return result
+        cache[cache_key] = []
+        return []
     text = mk_path.read_text(errors="replace")
     tokens = include_tokens(text)
     candidates = []
@@ -295,32 +263,8 @@ def scan_include_candidates(cfg: dict, mk_row: dict) -> tuple[list[dict], bool]:
                 continue
             seen.add(rel_candidate)
             candidates.append({"from": mk_row["path"], "include": token, "path": rel_candidate})
-    can_cover_includes = bool(tokens) and not is_include_only_aggregator(text)
-    result = (candidates, can_cover_includes)
-    cache[cache_key] = result
-    return result
-
-
-def collect_transitive_include_candidates(cfg: dict, row: dict) -> list[dict]:
-    collected = []
-    seen = set()
-    origin = row["path"]
-    max_depth = int(cfg.get("include_transitive_depth", 2))
-
-    def visit(current: dict, depth: int) -> None:
-        if depth > max_depth:
-            return
-        candidates, _ = scan_include_candidates(cfg, current)
-        for candidate in candidates:
-            path = candidate["path"]
-            if not path or path == origin or path in seen:
-                continue
-            seen.add(path)
-            collected.append(candidate)
-            visit({"path": path}, depth + 1)
-
-    visit(row, 1)
-    return collected
+    cache[cache_key] = candidates
+    return candidates
 
 
 def load_discovered_mk_paths(state: pathlib.Path) -> list[str]:
@@ -334,14 +278,12 @@ def load_discovered_mk_paths(state: pathlib.Path) -> list[str]:
     return known
 
 
-def enrich_and_filter_mk_rows(cfg: dict, rows: list[dict], state: pathlib.Path) -> tuple[list[dict], list[dict]]:
+def enrich_mk_rows(cfg: dict, rows: list[dict], state: pathlib.Path) -> list[dict]:
     cfg["_known_mk_paths"] = load_discovered_mk_paths(state)
     if not cfg.get("include_prescan_enabled", True):
-        print("include pre-scan disabled; analyzing mk files without include coverage skip", flush=True)
-        return rows, []
+        print("include pre-scan disabled; analyzing every mk file without include candidate context", flush=True)
+        return rows
 
-    by_path = {row["path"]: row for row in rows}
-    covered_by: dict[str, str] = {}
     enriched = []
     print(
         "pre-scanning include candidates "
@@ -353,42 +295,12 @@ def enrich_and_filter_mk_rows(cfg: dict, rows: list[dict], state: pathlib.Path) 
     for index, row in enumerate(rows, start=1):
         if index == 1 or index == len(rows) or index % 50 == 0:
             progress(index, len(rows), f"prescan {row['path']}")
-        direct_candidates, can_cover = scan_include_candidates(cfg, row)
-        candidates = list(direct_candidates)
-        if can_cover:
-            seen_candidate_paths = {candidate.get("path") for candidate in candidates if candidate.get("path")}
-            for candidate in collect_transitive_include_candidates(cfg, row):
-                candidate_path = candidate.get("path")
-                if candidate_path and candidate_path not in seen_candidate_paths:
-                    candidates.append(candidate)
-                    seen_candidate_paths.add(candidate_path)
+        candidates = scan_include_candidates(cfg, row)
         if candidates:
             row = dict(row)
             row["include_candidates"] = candidates
         enriched.append(row)
-        if can_cover:
-            for candidate in candidates:
-                candidate_path = candidate["path"]
-                if candidate_path in by_path and candidate_path not in covered_by:
-                    covered_by[candidate_path] = row["path"]
-
-    filtered = []
-    skipped = []
-    for row in enriched:
-        covering_path = covered_by.get(row["path"])
-        if covering_path:
-            skipped.append(
-                {
-                    "schema_version": 1,
-                    "path": row["path"],
-                    "status": "skipped_included_mk",
-                    "covered_by": covering_path,
-                    "reason": "included by another primary mk file that is analyzed as the owning build target",
-                }
-            )
-            continue
-        filtered.append(row)
-    return filtered, skipped
+    return enriched
 
 
 def mk_rows_from_manual_files(cfg: dict, values: list[str]) -> list[dict]:
@@ -441,6 +353,57 @@ def merge_legacy_analysis_failures(latest: dict[str, dict], failure_path: pathli
     return latest
 
 
+def seed_analysis_board(
+    board: dict,
+    mk_rows: list[dict],
+    latest_status: dict[str, dict],
+    results_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+) -> None:
+    for index, row in enumerate(mk_rows, start=1):
+        mk_id = row["mk_id"]
+        result_path = results_dir / f"{mk_id}.v2-mk-analyzer.out"
+        stderr_path = logs_dir / f"{mk_id}.v2-mk-analyzer.err"
+        item = get_item(board, "analysis", mk_id)
+        fields = {
+            "path": row["path"],
+            "order": index,
+            "stdout_log": rel(result_path),
+            "stderr_log": rel(stderr_path),
+        }
+        if item is None:
+            legacy = latest_status.get(mk_id, {})
+            status = legacy.get("status", "pending")
+            if status in {"done", "empty"} and not result_path.exists():
+                status = "pending"
+            fields.update(
+                {
+                    "status": status,
+                    "returncode": legacy.get("returncode"),
+                    "rows": legacy.get("rows"),
+                }
+            )
+            upsert_item(board, "analysis", mk_id, **fields)
+        else:
+            upsert_item(board, "analysis", mk_id, touch=False, **fields)
+
+
+def update_analysis_board(board: dict, status_row: dict) -> None:
+    upsert_item(
+        board,
+        "analysis",
+        status_row["mk_id"],
+        status=status_row.get("status"),
+        path=status_row.get("path"),
+        returncode=status_row.get("returncode"),
+        rows=status_row.get("rows"),
+        reused=status_row.get("reused"),
+        timeout_seconds=status_row.get("timeout_seconds"),
+        stdout_log=status_row.get("stdout_log"),
+        stderr_log=status_row.get("stderr_log"),
+    )
+
+
 def normalize_rows(mk_row: dict, rows: list[dict]) -> list[dict]:
     normalized = []
     for idx, row in enumerate(rows):
@@ -460,6 +423,7 @@ def rows_from_existing_result(mk_row: dict, result_path: pathlib.Path) -> list[d
 
 def should_reuse_analysis(
     mk_row: dict,
+    board_item: dict | None,
     latest_status: dict | None,
     result_path: pathlib.Path,
     stderr_path: pathlib.Path,
@@ -467,6 +431,8 @@ def should_reuse_analysis(
 ) -> bool:
     if not resume or not result_path.exists():
         return False
+    if board_item:
+        return board_item.get("status") in {"done", "empty"}
     if latest_status:
         return latest_status.get("status") in {"done", "empty"}
     rows = extract_json_objects(result_path.read_text(errors="replace"))
@@ -485,6 +451,7 @@ def analyze_one(
     prompts_dir: pathlib.Path,
     results_dir: pathlib.Path,
     logs_dir: pathlib.Path,
+    board_item: dict | None,
     latest_status: dict | None,
     timeout: int | None,
     resume: bool,
@@ -492,7 +459,7 @@ def analyze_one(
     prompt_path = prompts_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.md"
     result_path = results_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.out"
     stderr_path = logs_dir / f"{mk_row['mk_id']}.v2-mk-analyzer.err"
-    if should_reuse_analysis(mk_row, latest_status, result_path, stderr_path, resume):
+    if should_reuse_analysis(mk_row, board_item, latest_status, result_path, stderr_path, resume):
         rows = rows_from_existing_result(mk_row, result_path)
         status = "done" if rows else "empty"
         status_row = {
@@ -585,7 +552,7 @@ def main() -> int:
     parser.add_argument(
         "--no-include-prescan",
         action="store_true",
-        help="disable local include pre-scan and skip coverage; useful for very large repositories",
+        help="disable local include pre-scan; useful when include candidate matching is too noisy",
     )
     args = parser.parse_args()
     if args.jobs < 1:
@@ -596,25 +563,29 @@ def main() -> int:
     timeout = args.timeout or int(cfg.get("analysis_opencode_timeout_seconds", cfg.get("opencode_timeout_seconds", 1800)))
     resume = not args.no_resume
     state = pathlib.Path(cfg["state_dir"])
-    mk_rows, skipped_rows = enrich_and_filter_mk_rows(cfg, load_mk_rows(cfg, state, args), state)
+    mk_rows = enrich_mk_rows(cfg, load_mk_rows(cfg, state, args), state)
     if args.limit > 0:
         mk_rows = mk_rows[: args.limit]
     write_jsonl(state / "analyze_inputs.jsonl", mk_rows)
-    write_jsonl(state / "skipped_mk_files.jsonl", skipped_rows)
+    write_jsonl(state / "skipped_mk_files.jsonl", [])
     targets_path = state / "targets.jsonl"
     status_path = state / "analysis_status.jsonl"
+    prompts_dir = state / "prompts"
+    results_dir = state / "opencode_results"
+    logs_dir = state / "logs"
     latest_status = merge_legacy_analysis_failures(
         latest_status_by_key(status_path, "mk_id"),
         state / "analysis_failures.jsonl",
     )
-    prompts_dir = state / "prompts"
-    results_dir = state / "opencode_results"
-    logs_dir = state / "logs"
+    board = load_board(cfg)
+    seed_analysis_board(board, mk_rows, latest_status, results_dir, logs_dir)
+    board_path = save_board(cfg, board)
     targets_path.unlink(missing_ok=True)
 
     print(
         f"analyzing {len(mk_rows)} mk file(s) with jobs={args.jobs}; "
-        f"timeout={timeout}s; resume={resume}; skipped {len(skipped_rows)} covered include file(s)"
+        f"timeout={timeout}s; resume={resume}; include-covered skip disabled; "
+        f"board={rel(board_path)}"
     )
     results: dict[int, tuple[list[dict], dict | None, dict, str]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
@@ -628,6 +599,7 @@ def main() -> int:
                 prompts_dir,
                 results_dir,
                 logs_dir,
+                get_item(board, "analysis", mk_row["mk_id"]),
                 latest_status.get(mk_row["mk_id"]),
                 timeout,
                 resume,
@@ -637,6 +609,8 @@ def main() -> int:
         for future in concurrent.futures.as_completed(futures):
             index, rows, failure, status_row, message = future.result()
             results[index] = (rows, failure, status_row, message)
+            update_analysis_board(board, status_row)
+            save_board(cfg, board)
             print(message)
 
     all_targets = []

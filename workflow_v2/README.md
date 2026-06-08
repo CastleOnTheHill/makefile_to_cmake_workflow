@@ -79,18 +79,30 @@ serializes tasks that target the same `CMakeLists.txt`, so different
 directories can run concurrently while one directory remains safe.
 
 Analysis and conversion run in resumable mode by default. Existing successful
-OpenCode outputs are reused; missing, failed, or timed-out items are retried
-once in the next invocation. Use `--no-resume` to force reruns. Per-OpenCode
-timeouts default to `analysis_opencode_timeout_seconds` and
-`conversion_opencode_timeout_seconds`, falling back to `opencode_timeout_seconds`.
-When a timeout fires, the OpenCode process group is terminated and the workflow
-continues to the next item.
+OpenCode outputs are reused from the task board; missing, failed, timed-out, or
+manually flagged items are retried in the next invocation. Use `--no-resume` to
+force reruns. Per-OpenCode timeouts default to
+`analysis_opencode_timeout_seconds` and `conversion_opencode_timeout_seconds`,
+falling back to `opencode_timeout_seconds`. When a timeout fires, the OpenCode
+process group is terminated and the workflow continues to the next item.
+
+The shared task board defaults to `workflow_v2/state/task_board.md` and can be
+overridden with `task_board_path`. Analysis and conversion update this Markdown
+file after each completed item. The rendered tables are for review; scripts
+resume from the embedded JSON block in that Markdown file. To force a converted
+target to rerun with human feedback:
+
+```bash
+workflow_v2/scripts/mark_conversion_issue.py workflow_v2/config.local.json <target_id> \
+  --comment "explain what is wrong with the generated CMake"
+workflow_v2/scripts/convert_targets.py workflow_v2/config.local.json
+```
 
 Before analysis, the script pre-scans `include`, `-include`, and `sinclude`
-statements. If one primary package.mk file includes another package.mk file and
-they jointly define the same artifact, the included file is marked as covered
-and skipped as a later primary input. Variable or wildcard includes are expanded
-into candidate `package.mk` paths and passed to the analyzer prompt. Candidate
+statements only to pass candidate context to the analyzer prompt. It does not
+mark included files as covered and does not skip any discovered Makefile,
+Android.mk, or *.mk input. Variable or wildcard includes are expanded into
+candidate `package.mk` paths and passed to the analyzer prompt. Candidate
 search is capped by `include_candidate_limit`, defaulting to 200. Candidate
 matching uses only `state/mk_files.jsonl`, the file list produced by
 `discover_mk_files.py`; `analyze_mk_files.py` does not recursively scan the
@@ -112,13 +124,15 @@ archived between experiments.
 - `state/mk_files.jsonl`: discovered Makefile/Android.mk/*.mk inputs.
 - `state/analyze_inputs.jsonl`: exact mk inputs used by the latest analysis
   run, including manually specified files.
-- `state/skipped_mk_files.jsonl`: mk files skipped because another analyzed
-  primary file includes them as part of the same artifact.
+- `state/skipped_mk_files.jsonl`: deprecated compatibility file; analysis no
+  longer skips include-covered mk files, so it is written empty.
 - `state/targets.jsonl`: analyzed target records produced by `v2-mk-analyzer`.
 - `state/analysis_status.jsonl`: per-mk analysis attempt status, including
   reused, failed, and timed-out runs.
 - `state/conversion_status.jsonl`: per-target conversion attempt status,
   including reused, failed, and timed-out runs.
+- `state/task_board.md`: unified Markdown board for analysis/conversion status;
+  resume uses this board first.
 - `state/build_state.jsonl`: build attempts and failure signatures.
 - `state/manual_required.md`: stalled failures that require human action.
 - `state/prompts/`: exact prompts sent to OpenCode.

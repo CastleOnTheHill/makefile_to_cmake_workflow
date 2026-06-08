@@ -17,8 +17,11 @@ tools:
 
 如果主输入文件 A include 了 package.mk 文件 B，并且 A 和 B 共同决定同一个产物的源码、
 宏、include、编译选项、链接选项或依赖库，则必须把 B 当作 A 的组成部分分析，
-并把 B 写入 `included_mk`。不要为 B 单独输出重复 target；外部脚本会根据 `included_mk`
-和预扫描结果跳过后续对 B 的独立分析。
+并把 B 写入 `included_mk`。
+
+工作流会让每一个已发现的 Makefile/Android.mk/*.mk 文件都作为主输入独立分析一次。
+不要因为当前文件可能被其他 mk include 而跳过当前文件；也不要假设外部脚本会根据
+`included_mk` 去重或跳过后续分析。重复 target 允许存在，后续阶段会人工或构建验证处理。
 
 如果遇到变量或条件 include，例如：
 

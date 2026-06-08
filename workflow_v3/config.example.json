@@ -1,0 +1,25 @@
+{
+  "project_root": ".",
+  "scan_subdir": "demo/cjson/src",
+  "board_path": "workflow_v3/state/tasks.xlsx",
+  "state_dir": "workflow_v3/state",
+  "opencode_bin": ".tools/node_modules/.bin/opencode",
+  "model": "deepseek/deepseek-v4-pro",
+  "api_key_file": "mykey.txt",
+  "opencode_timeout_seconds": 1800,
+  "analysis_opencode_timeout_seconds": 1800,
+  "conversion_opencode_timeout_seconds": 1800,
+  "mk_file_patterns": [
+    "Android.mk",
+    "*.mk",
+    "Makefile"
+  ],
+  "ignore_dirs": [
+    ".git",
+    ".tools",
+    ".opencode/node_modules",
+    "demo/*/cmake-build",
+    "demo/*/original",
+    "demo/*/converted"
+  ]
+}

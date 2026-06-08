@@ -27,6 +27,8 @@ workflow/manual_required.md
 workflow_v2/state/
 workflow_v2/out/
 workflow_v2/config.local.json
+workflow_v3/state/
+workflow_v3/config.local.json
 
 # Python/cache/build noise
 __pycache__/
