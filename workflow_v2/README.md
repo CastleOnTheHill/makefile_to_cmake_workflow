@@ -91,7 +91,10 @@ statements. If one primary package.mk file includes another package.mk file and
 they jointly define the same artifact, the included file is marked as covered
 and skipped as a later primary input. Variable or wildcard includes are expanded
 into candidate `package.mk` paths and passed to the analyzer prompt. Candidate
-search is capped by `include_candidate_limit`, defaulting to 200.
+search is capped by `include_candidate_limit`, defaulting to 200. Candidate
+matching uses only `state/mk_files.jsonl`, the file list produced by
+`discover_mk_files.py`; `analyze_mk_files.py` does not recursively scan the
+filesystem. Use `--no-include-prescan` to bypass this local pre-scan.
 
 If the build repair loop stops for manual intervention, fix the generated CMake
 or project inputs, mark the item, then rerun the loop:

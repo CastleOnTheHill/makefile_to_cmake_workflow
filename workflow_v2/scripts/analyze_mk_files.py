@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import concurrent.futures
-import glob
+import fnmatch
 import json
 import pathlib
 import re
@@ -9,7 +9,7 @@ import re
 from common import TIMEOUT_RETURNCODE, append_jsonl, extract_json_objects, load_config, now, progress, read_jsonl, rel, run, stable_id, write_jsonl, write_text
 
 
-INCLUDE_RE = re.compile(r"^\s*-?\s*(?:include|sinclude)\s+(.+?)\s*$")
+INCLUDE_RE = re.compile(r"^\s*(?:-|s)?include\s+(.+?)\s*$")
 MAKE_VAR_RE = re.compile(r"\$\(([^)]+)\)")
 TARGET_CUES = (
     "LOCAL_MODULE",
@@ -177,13 +177,55 @@ def fixed_suffix_after_last_make_var(token: str) -> str:
     return name if name else "package.mk"
 
 
-def glob_candidates(root: pathlib.Path, pattern: str, limit: int) -> list[pathlib.Path]:
+def known_mk_paths(cfg: dict) -> list[str]:
+    return list(cfg.get("_known_mk_paths", []))
+
+
+def known_mk_path_set(cfg: dict) -> set[str]:
+    return set(known_mk_paths(cfg))
+
+
+def known_candidate_by_exact_path(cfg: dict, path: pathlib.Path) -> list[pathlib.Path]:
+    project_root = pathlib.Path(cfg["project_root"]).resolve()
+    try:
+        rel_path = path.resolve().relative_to(project_root).as_posix()
+    except ValueError:
+        return []
+    if rel_path not in known_mk_path_set(cfg):
+        return []
+    return [path.resolve()]
+
+
+def known_candidates_by_pattern(cfg: dict, pattern: str, limit: int) -> list[pathlib.Path]:
+    project_root = pathlib.Path(cfg["project_root"]).resolve()
+    pattern_text = str(pattern).replace("\\", "/")
     matches = []
-    full_pattern = pattern if pathlib.Path(pattern).is_absolute() else str(root / pattern)
-    for raw in sorted(glob.glob(full_pattern, recursive=True)):
-        path = pathlib.Path(raw)
-        if path.is_file():
-            matches.append(path.resolve())
+    for rel_path in known_mk_paths(cfg):
+        abs_path = (project_root / rel_path).resolve()
+        rel_text = rel_path.replace("\\", "/")
+        abs_text = abs_path.as_posix()
+        if fnmatch.fnmatch(abs_text, pattern_text) or fnmatch.fnmatch(rel_text, pattern_text):
+            matches.append(abs_path)
+            if len(matches) >= limit:
+                break
+    return matches
+
+
+def known_candidates_by_suffix(
+    cfg: dict,
+    suffix: str,
+    *,
+    allow_pattern: bool,
+    limit: int,
+) -> list[pathlib.Path]:
+    project_root = pathlib.Path(cfg["project_root"]).resolve()
+    suffix = suffix.replace("\\", "/").lstrip("/")
+    matches = []
+    for rel_path in known_mk_paths(cfg):
+        rel_text = rel_path.replace("\\", "/")
+        matched = fnmatch.fnmatch(rel_text, suffix) if allow_pattern else rel_text.endswith(suffix)
+        if matched:
+            matches.append((project_root / rel_path).resolve())
             if len(matches) >= limit:
                 break
     return matches
@@ -193,6 +235,11 @@ def resolve_include_token(cfg: dict, mk_path: pathlib.Path, token: str) -> list[
     root = pathlib.Path(cfg["project_root"]).resolve()
     limit = int(cfg.get("include_candidate_limit", 200))
     local_path = mk_path.parent.resolve()
+    cache_key = (str(local_path), token)
+    cache = cfg.setdefault("_include_token_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
     normalized = token.replace("\\", "/")
     normalized = normalized.replace("$(LOCAL_PATH)", str(local_path))
     normalized = normalized.replace("${LOCAL_PATH}", str(local_path))
@@ -206,66 +253,115 @@ def resolve_include_token(cfg: dict, mk_path: pathlib.Path, token: str) -> list[
         if not path_pattern.is_absolute():
             path_pattern = local_path / path_pattern
         if any(ch in str(path_pattern) for ch in "*?["):
-            return glob_candidates(root, str(path_pattern), limit)
-        return [path_pattern.resolve()] if path_pattern.is_file() else []
+            result = known_candidates_by_pattern(cfg, str(path_pattern), limit)
+        else:
+            result = known_candidate_by_exact_path(cfg, path_pattern)
+        cache[cache_key] = result
+        return result
 
     suffix = fixed_suffix_after_last_make_var(normalized)
     suffix = suffix.replace("**/", "")
     if not suffix or suffix == ".":
         suffix = "package.mk"
-    if any(ch in suffix for ch in "*?["):
-        pattern = f"**/{suffix}"
-    else:
-        pattern = f"**/{suffix}"
-    return glob_candidates(root, pattern, limit)
+    allow_pattern = any(ch in suffix for ch in "*?[")
+    result = known_candidates_by_suffix(cfg, suffix, allow_pattern=allow_pattern, limit=limit)
+    cache[cache_key] = result
+    return result
 
 
 def scan_include_candidates(cfg: dict, mk_row: dict) -> tuple[list[dict], bool]:
+    if not cfg.get("include_prescan_enabled", True):
+        return [], False
+    cache = cfg.setdefault("_include_scan_cache", {})
+    cache_key = mk_row["path"]
+    if cache_key in cache:
+        return cache[cache_key]
+
     root = pathlib.Path(cfg["project_root"])
     mk_path = root / mk_row["path"]
     if not mk_path.exists():
-        return [], False
+        result = ([], False)
+        cache[cache_key] = result
+        return result
     text = mk_path.read_text(errors="replace")
     tokens = include_tokens(text)
     candidates = []
     seen = set()
     for token in tokens:
-        for candidate in resolve_include_token(cfg, mk_path, token):
+        resolved = resolve_include_token(cfg, mk_path, token)
+        for candidate in resolved:
             rel_candidate = rel(candidate, root)
             if rel_candidate == mk_row["path"] or rel_candidate in seen:
                 continue
             seen.add(rel_candidate)
             candidates.append({"from": mk_row["path"], "include": token, "path": rel_candidate})
     can_cover_includes = bool(tokens) and not is_include_only_aggregator(text)
-    return candidates, can_cover_includes
+    result = (candidates, can_cover_includes)
+    cache[cache_key] = result
+    return result
 
 
 def collect_transitive_include_candidates(cfg: dict, row: dict) -> list[dict]:
     collected = []
     seen = set()
     origin = row["path"]
+    max_depth = int(cfg.get("include_transitive_depth", 2))
 
-    def visit(current: dict) -> None:
+    def visit(current: dict, depth: int) -> None:
+        if depth > max_depth:
+            return
         candidates, _ = scan_include_candidates(cfg, current)
         for candidate in candidates:
             path = candidate["path"]
-            if path == origin or path in seen:
+            if not path or path == origin or path in seen:
                 continue
             seen.add(path)
             collected.append(candidate)
-            visit({"path": path})
+            visit({"path": path}, depth + 1)
 
-    visit(row)
+    visit(row, 1)
     return collected
 
 
-def enrich_and_filter_mk_rows(cfg: dict, rows: list[dict]) -> tuple[list[dict], list[dict]]:
+def load_discovered_mk_paths(state: pathlib.Path) -> list[str]:
+    known = []
+    seen = set()
+    for row in read_jsonl(state / "mk_files.jsonl"):
+        path = row.get("path")
+        if path and path not in seen:
+            seen.add(path)
+            known.append(path)
+    return known
+
+
+def enrich_and_filter_mk_rows(cfg: dict, rows: list[dict], state: pathlib.Path) -> tuple[list[dict], list[dict]]:
+    cfg["_known_mk_paths"] = load_discovered_mk_paths(state)
+    if not cfg.get("include_prescan_enabled", True):
+        print("include pre-scan disabled; analyzing mk files without include coverage skip", flush=True)
+        return rows, []
+
     by_path = {row["path"]: row for row in rows}
     covered_by: dict[str, str] = {}
     enriched = []
-    for row in rows:
+    print(
+        "pre-scanning include candidates "
+        f"for {len(rows)} mk file(s); enabled={cfg.get('include_prescan_enabled', True)}; "
+        f"known_mk_files={len(known_mk_paths(cfg))}; "
+        f"candidate_source={state / 'mk_files.jsonl'}",
+        flush=True,
+    )
+    for index, row in enumerate(rows, start=1):
+        if index == 1 or index == len(rows) or index % 50 == 0:
+            progress(index, len(rows), f"prescan {row['path']}")
         direct_candidates, can_cover = scan_include_candidates(cfg, row)
-        candidates = collect_transitive_include_candidates(cfg, row) if can_cover else direct_candidates
+        candidates = list(direct_candidates)
+        if can_cover:
+            seen_candidate_paths = {candidate.get("path") for candidate in candidates if candidate.get("path")}
+            for candidate in collect_transitive_include_candidates(cfg, row):
+                candidate_path = candidate.get("path")
+                if candidate_path and candidate_path not in seen_candidate_paths:
+                    candidates.append(candidate)
+                    seen_candidate_paths.add(candidate_path)
         if candidates:
             row = dict(row)
             row["include_candidates"] = candidates
@@ -486,14 +582,21 @@ def main() -> int:
         help="per-OpenCode analysis timeout in seconds; defaults to analysis_opencode_timeout_seconds or opencode_timeout_seconds from config",
     )
     parser.add_argument("--no-resume", action="store_true", help="rerun every analysis task instead of reusing existing successful results")
+    parser.add_argument(
+        "--no-include-prescan",
+        action="store_true",
+        help="disable local include pre-scan and skip coverage; useful for very large repositories",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
     cfg = load_config(args.config)
+    if args.no_include_prescan:
+        cfg["include_prescan_enabled"] = False
     timeout = args.timeout or int(cfg.get("analysis_opencode_timeout_seconds", cfg.get("opencode_timeout_seconds", 1800)))
     resume = not args.no_resume
     state = pathlib.Path(cfg["state_dir"])
-    mk_rows, skipped_rows = enrich_and_filter_mk_rows(cfg, load_mk_rows(cfg, state, args))
+    mk_rows, skipped_rows = enrich_and_filter_mk_rows(cfg, load_mk_rows(cfg, state, args), state)
     if args.limit > 0:
         mk_rows = mk_rows[: args.limit]
     write_jsonl(state / "analyze_inputs.jsonl", mk_rows)

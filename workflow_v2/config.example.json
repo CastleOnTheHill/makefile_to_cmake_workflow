@@ -13,7 +13,9 @@
   "opencode_timeout_seconds": 1800,
   "analysis_opencode_timeout_seconds": 1800,
   "conversion_opencode_timeout_seconds": 1800,
+  "include_prescan_enabled": true,
   "include_candidate_limit": 200,
+  "include_transitive_depth": 2,
   "mk_file_patterns": [
     "Android.mk",
     "*.mk",
