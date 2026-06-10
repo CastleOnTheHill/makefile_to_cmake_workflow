@@ -5,10 +5,13 @@ import fnmatch
 import json
 import os
 import pathlib
+import queue
 import re
 import shlex
 import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,25 +32,7 @@ from common import (
 
 
 TEXT_FILE_NAMES = {"Android.mk", "CMakeLists.txt", "Makefile"}
-TEXT_SUFFIXES = {
-    ".S",
-    ".asm",
-    ".c",
-    ".cc",
-    ".cmake",
-    ".cpp",
-    ".cxx",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".inc",
-    ".in",
-    ".json",
-    ".mk",
-    ".s",
-    ".txt",
-}
+SNAPSHOT_FILE_NAMES = {"CMakeLists.txt"}
 
 
 @dataclass(frozen=True)
@@ -142,6 +127,7 @@ def configured_build_commands(cfg: dict[str, Any]) -> list[BuildCommand]:
 
 
 def run_shell_command(command: BuildCommand, cfg: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+    echo_output = bool(cfg.get("build_repair_echo_output", True))
     proc = subprocess.Popen(
         command.command,
         shell=True,
@@ -153,24 +139,61 @@ def run_shell_command(command: BuildCommand, cfg: dict[str, Any]) -> subprocess.
         executable="/bin/bash",
         start_new_session=True,
     )
-    try:
-        stdout, _ = proc.communicate(timeout=command.timeout)
-        return subprocess.CompletedProcess(command.command, proc.returncode, stdout or "", "")
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout, _ = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
+    output_queue: queue.Queue[str] = queue.Queue()
+
+    def read_output() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output_queue.put(line)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    lines: list[str] = []
+
+    def drain_output() -> None:
+        while True:
+            try:
+                line = output_queue.get_nowait()
+            except queue.Empty:
+                return
+            lines.append(line)
+            if echo_output:
+                print(line, end="", flush=True)
+
+    deadline = time.monotonic() + command.timeout
+    timed_out = False
+    while proc.poll() is None:
+        drain_output()
+        if time.monotonic() > deadline:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            break
+        time.sleep(0.1)
+
+    if timed_out:
+        stop_deadline = time.monotonic() + 5
+        while proc.poll() is None and time.monotonic() < stop_deadline:
+            drain_output()
+            time.sleep(0.1)
+        if proc.poll() is None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            stdout, _ = proc.communicate()
+            proc.wait()
+        reader.join(timeout=5)
+        drain_output()
         timeout_msg = f"\n[TIMEOUT] build command exceeded timeout_seconds={command.timeout}; process group was terminated.\n"
-        return subprocess.CompletedProcess(command.command, TIMEOUT_RETURNCODE, (stdout or "") + timeout_msg, "")
+        if echo_output:
+            print(timeout_msg, end="", flush=True)
+        return subprocess.CompletedProcess(command.command, TIMEOUT_RETURNCODE, "".join(lines) + timeout_msg, "")
+
+    reader.join(timeout=5)
+    drain_output()
+    return subprocess.CompletedProcess(command.command, proc.returncode, "".join(lines), "")
 
 
 def relative_to_project(cfg: dict[str, Any], path: pathlib.Path) -> str:
@@ -203,8 +226,8 @@ def should_ignore_dir(cfg: dict[str, Any], path: pathlib.Path) -> bool:
     return False
 
 
-def is_text_candidate(path: pathlib.Path) -> bool:
-    return path.name in TEXT_FILE_NAMES or path.suffix in TEXT_SUFFIXES
+def is_snapshot_candidate(path: pathlib.Path) -> bool:
+    return path.name in SNAPSHOT_FILE_NAMES
 
 
 def read_snapshot_text(path: pathlib.Path, max_bytes: int) -> str | None:
@@ -243,7 +266,7 @@ def take_snapshot(cfg: dict[str, Any]) -> dict[str, SnapshotEntry]:
                 for filename in filenames:
                     files.append(current / filename)
         for path in files:
-            if not is_text_candidate(path):
+            if not is_snapshot_candidate(path):
                 continue
             text = read_snapshot_text(path, max_bytes)
             if text is None:
@@ -534,13 +557,20 @@ conditions:
 
 %s
 
+Allowed edit scope:
+
+- You may only create or modify `CMakeLists.txt` files.
+- Do not modify source files, headers, Makefile, Android.mk, or *.mk files.
+- The outer workflow only records diffs for `CMakeLists.txt`; edits elsewhere
+  are forbidden even if they seem useful.
+
 Requirements:
 
 - Make the smallest edit that should advance the build.
 - Do not run configure, build, tests, git, or shell commands.
 - Do not delete files. If a fix would require deleting a file, stop and write a
   concise note to the manual handoff file instead.
-- Prefer editing generated `CMakeLists.txt` files or other conversion outputs.
+- Only edit generated or existing `CMakeLists.txt` files.
 - Keep behavior aligned with the nearby mk/Makefile implementation.
 - Use target-scoped modern CMake commands.
 - Do not use unexpanded wildcards in `add_library`, `add_executable`, or
@@ -611,12 +641,24 @@ def run_fixer(
             "--",
             "Fix this workflow_v3 build failure with the smallest safe edit.",
         ]
+        print(
+            f"[fixer] handing failure to OpenCode agent=v3-build-fixer "
+            f"try={retry_index}/{retries} timeout={timeout}s",
+            flush=True,
+        )
+        print(f"[fixer] prompt: {prompt_path}", flush=True)
+        print("[fixer] waiting for OpenCode result...", flush=True)
         cp = run(cmd, cfg, timeout=timeout)
         write_text(stdout_path, cp.stdout)
         write_text(stderr_path, cp.stderr)
         last_cp = cp
         last_stdout = stdout_path
         last_stderr = stderr_path
+        print(
+            f"[fixer] OpenCode finished returncode={cp.returncode} "
+            f"stdout={stdout_path} stderr={stderr_path}",
+            flush=True,
+        )
         if cp.returncode == TIMEOUT_RETURNCODE and retry_index < retries:
             print(f"[fixer] timeout; retry {retry_index + 1}/{retries}", flush=True)
             continue
@@ -636,9 +678,12 @@ def run_build_sequence(
         print(f"[build] attempt={attempt} command={index}/{len(commands)} name={command.name}", flush=True)
         print(f"  cwd: {command.cwd}", flush=True)
         print(f"  command: {command.command}", flush=True)
+        print(f"  timeout: {command.timeout}s", flush=True)
+        print("  output:", flush=True)
         cp = run_shell_command(command, cfg)
         log_path = logs_dir / f"build.{attempt:03d}.{index:02d}-{sanitize_name(command.name)}.log"
         write_text(log_path, cp.stdout)
+        print(f"[build] command finished returncode={cp.returncode} log={log_path}", flush=True)
         if cp.returncode != 0:
             return command, cp, log_path
     return None
@@ -794,6 +839,9 @@ def main() -> int:
         excerpt = error_excerpt(cp.stdout, excerpt_lines)
         signature = failure_signature(cp.stdout, excerpt_lines)
         key = failure_key(cp.stdout, excerpt_lines)
+        print(f"[build] failed command={command.name} signature={signature}", flush=True)
+        print("[build] latest error excerpt:", flush=True)
+        print(excerpt, flush=True)
 
         if pending_fix and pending_fix.get("signature") != signature:
             append_experience(cfg, pending_fix, f"advanced to new failure signature `{signature}`")
@@ -840,10 +888,15 @@ def main() -> int:
             print(f"[build] stalled on signature {signature}; see {state_file(cfg, 'manual_required_file', 'manual_required.md')}", flush=True)
             return 10
 
+        print("[snapshot] taking before snapshot for CMakeLists.txt files only...", flush=True)
         before = take_snapshot(cfg)
+        print(f"[snapshot] tracked before={len(before)} CMakeLists.txt file(s)", flush=True)
         fixer_cp, prompt_path, stdout_path, stderr_path, retry_index = run_fixer(cfg, command, attempt, signature, excerpt, build_log)
+        print("[snapshot] taking after snapshot for CMakeLists.txt files only...", flush=True)
         after = take_snapshot(cfg)
+        print(f"[snapshot] tracked after={len(after)} CMakeLists.txt file(s)", flush=True)
         changes = diff_snapshots(before, after)
+        print(f"[snapshot] detected {len(changes)} changed CMakeLists.txt file(s)", flush=True)
 
         deleted = [change for change in changes if change.status == "deleted"]
         if deleted:

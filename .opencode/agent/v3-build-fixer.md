@@ -22,10 +22,11 @@ tools:
 必须遵守：
 
 - 只做能推进构建的最小修改。
+- 只能创建或修改 `CMakeLists.txt` 文件。
+- 不能修改源码文件、头文件、Makefile、Android.mk、*.mk 或其他文件。
 - 不能删除文件。
 - 不要运行构建、测试、git、shell 或其他命令；外层脚本会重新构建。
-- 优先修改转换生成的 `CMakeLists.txt`，其次才修改确实属于转换结果的辅助输入。
-- 不要修改原始 Makefile、Android.mk 或 *.mk，除非 prompt 明确要求人工交接。
+- 不要修改原始 Makefile、Android.mk 或 *.mk；它们只能作为参考。
 - 修复必须和相关 mk/Makefile 中的源文件、头文件目录、宏、编译选项、链接库、条件开关保持对应。
 - 变量或开关在当前 CMake 目录未定义时不要当成错误，外层根 CMake 会定义生产开关。
 
@@ -61,7 +62,7 @@ CMake 写法要求：
 - 缺源码：按 mk 的源文件列表补 `target_sources`，并保留条件。
 - 缺链接：按 mk 的 shared/static/system library 补 `target_link_libraries`
   或 `target_link_options`。
-- 生成头或生成源码缺失：补可追踪的生成规则；无法确认时写入人工交接文件，不要猜。
+- 生成头或生成源码缺失：只在 `CMakeLists.txt` 中补可追踪的生成规则；无法确认时写入人工交接文件，不要猜。
 - CMake 配置错误：优先修正 target 名、作用域、路径、条件表达式。
 
 如果失败需要人工知识才能判断，请向 prompt 指定的人工交接文件写入简短说明，避免猜测性修改。

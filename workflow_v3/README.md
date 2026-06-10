@@ -99,8 +99,14 @@ workflow_v3/scripts/build_repair_loop.py workflow_v3/config.local.json
 
 `build_commands` is an ordered list. Each command has `name`, `cwd`, and
 `command`; the loop restarts from the first command after every fix. On failure
-it writes the full build log, calls `v3-build-fixer`, records the fix summary,
-and appends a per-file diff to `build_repair_log.md`.
+it prints the command output, writes the full build log, calls `v3-build-fixer`,
+records the fix summary, and appends per-file `CMakeLists.txt` diffs to
+`build_repair_log.md`.
+
+The fixer is intentionally restricted to `CMakeLists.txt`. It may read nearby
+mk/Makefile context, but it must not modify source files, headers, Makefile,
+Android.mk, or `*.mk` files. `build_repair_snapshot_roots` controls where the
+script searches for `CMakeLists.txt` files to diff before and after a fix.
 
 Important files:
 
