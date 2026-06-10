@@ -177,6 +177,61 @@ def extract_json_objects(text: str) -> list[dict[str, Any]]:
     return []
 
 
+def failure_key(text: str, lines: int = 120) -> str:
+    patterns = (
+        "FAILED:",
+        "error:",
+        "fatal error:",
+        "undefined reference",
+        "No such file",
+        "No rule to make target",
+        "CMake Error",
+        "collect2: error",
+        "ld:",
+        "ninja: build stopped",
+    )
+    all_lines = text.splitlines()
+    selected: list[str] = []
+    for index, line in enumerate(all_lines):
+        if any(pattern in line for pattern in patterns):
+            end = min(len(all_lines), index + 12)
+            selected.extend(item.strip() for item in all_lines[index:end])
+            selected.append("---")
+    if not selected:
+        selected = [line.strip() for line in all_lines[-lines:]]
+    return "\n".join(selected[-lines:])
+
+
+def failure_signature(text: str, lines: int = 120) -> str:
+    return hashlib.sha256(failure_key(text, lines).encode(errors="replace")).hexdigest()[:16]
+
+
+def error_excerpt(text: str, lines: int = 180) -> str:
+    patterns = (
+        "FAILED:",
+        "error:",
+        "fatal error:",
+        "undefined reference",
+        "No such file",
+        "No rule to make target",
+        "CMake Error",
+        "collect2: error",
+        "ld:",
+        "ninja: build stopped",
+    )
+    all_lines = text.splitlines()
+    selected: list[str] = []
+    for index, line in enumerate(all_lines):
+        if any(pattern in line for pattern in patterns):
+            start = max(0, index - 10)
+            end = min(len(all_lines), index + 24)
+            selected.extend(all_lines[start:end])
+            selected.append("---")
+    if selected:
+        return "\n".join(selected[-lines:])
+    return "\n".join(all_lines[-lines:])
+
+
 def cmake_path_for_mk(cfg: dict[str, Any], mk_rel_path: str) -> pathlib.Path:
     mk_path = pathlib.Path(mk_rel_path)
     if not mk_path.is_absolute():

@@ -21,6 +21,8 @@ Makefile、Android.mk 或 *.mk 文件，不要创建其他 CMake 片段文件。
   `# workflow_v3:mk_task_id=<task_id> source_mk=<source_mk>`
 - 如果已有相同 `workflow_v3:mk_task_id=...` 的块，更新该块，不要重复追加。
 - 不要根据产品名或 workflow 构建命令生成 CMake 条件。v3 prompt 不包含产品配置。
+- 如果 prompt 中包含构建修复经验，只在和当前 mk 转换相关时吸收其中规则；经验用于避免
+  重复生成已知会导致构建失败的 CMake 写法。
 
 优先使用 target 级 CMake：
 

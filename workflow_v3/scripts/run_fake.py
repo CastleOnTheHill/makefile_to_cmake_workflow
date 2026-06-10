@@ -57,9 +57,9 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=60, help="per-fake-OpenCode timeout seconds")
     parser.add_argument(
         "--stage",
-        choices=["all", "discover", "analyze", "convert"],
+        choices=["all", "discover", "analyze", "convert", "build"],
         default="all",
-        help="run only one stage or the full fake workflow",
+        help="run only one stage or the discover/analyze/convert fake workflow",
     )
     parser.add_argument("--force-analyze", action="store_true", help="force rerun fake analysis")
     parser.add_argument("--force-convert", action="store_true", help="force rerun fake conversion")
@@ -95,6 +95,8 @@ def main() -> int:
             steps.append(("analyze_mk_files.py", common + analyze_extra))
         if args.stage in {"all", "convert"}:
             steps.append(("convert_targets.py", common + convert_extra))
+        if args.stage == "build":
+            steps.append(("build_repair_loop.py", []))
 
         for step, step_args in steps:
             code = run_step(step, fake_config, step_args)

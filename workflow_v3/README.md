@@ -19,6 +19,7 @@ Copy `workflow_v3/config.example.json` to a local config and update:
 - `board_path`: Excel task board path.
 - `state_dir`: minimal runtime logs and analysis JSONL.
 - `opencode_bin`, `model`, `api_key_file`.
+- `build_commands`: configure/build commands to verify after conversion.
 
 CMake output is not configurable in v3. Each row writes to `CMakeLists.txt`
 beside the original mk/makefile.
@@ -86,3 +87,33 @@ workflow_v3/scripts/run_fake.py workflow_v3/config.local.json -j 8 --limit 100
 It runs discover/analyze/convert with `workflow_v3/scripts/fake_opencode.py`.
 The generated `CMakeLists.txt` files contain only workflow trace comments, not
 real targets.
+
+## Build Repair Loop
+
+After conversion, run the configured build commands and let OpenCode repair one
+failure at a time:
+
+```bash
+workflow_v3/scripts/build_repair_loop.py workflow_v3/config.local.json
+```
+
+`build_commands` is an ordered list. Each command has `name`, `cwd`, and
+`command`; the loop restarts from the first command after every fix. On failure
+it writes the full build log, calls `v3-build-fixer`, records the fix summary,
+and appends a per-file diff to `build_repair_log.md`.
+
+Important files:
+
+- `build_repair_log.md`: detailed build failures, fixer summaries, and diffs.
+- `build_repair_state.json`: resume state.
+- `build_experience.md`: compact lessons learned from successful progress.
+- `manual_required.md`: current handoff when progress stalls or the fixer fails.
+
+If the same failure signature repeats `max_same_failure` times, the script
+stops for manual repair. After editing files manually, rerun the same command.
+
+Fake build plumbing check:
+
+```bash
+workflow_v3/scripts/run_fake.py workflow_v3/config.local.json --stage build
+```

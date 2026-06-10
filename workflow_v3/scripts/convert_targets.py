@@ -135,6 +135,19 @@ def ensure_cmake_file(path: pathlib.Path) -> None:
         )
 
 
+def build_experience_for_prompt(cfg: dict) -> str:
+    path = cfg.get("build_experience_file")
+    if path:
+        experience_path = resolve_path(path)
+    else:
+        experience_path = pathlib.Path(cfg["state_dir"]) / "build_experience.md"
+    if not experience_path.exists():
+        return "_No build repair experience has been recorded yet._"
+    lines = experience_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    prompt_lines = int(cfg.get("build_experience_prompt_lines", 80))
+    return "\n".join(lines[-prompt_lines:])
+
+
 def prompt_for(cfg: dict, row: dict[str, str], targets: list[dict], manual_comment: str) -> str:
     cmake_file = cmake_path_for_mk(cfg, row[COL_MK_PATH])
     manual_section = ""
@@ -161,6 +174,12 @@ Existing direct child directories that already contain CMakeLists.txt:
 
 Target JSON records:
 ```json
+%s
+```
+
+Compact build repair experience. Apply these lessons when they are relevant to
+this mk conversion:
+```markdown
 %s
 ```
 %s
@@ -210,6 +229,7 @@ risks.
         str(cmake_file),
         json.dumps(existing_child_cmake_lists(cfg, row[COL_MK_PATH], cmake_file), ensure_ascii=False, indent=2),
         json.dumps(targets, ensure_ascii=False, indent=2),
+        build_experience_for_prompt(cfg),
         manual_section,
         str(cmake_file),
         row[COL_TASK_ID],

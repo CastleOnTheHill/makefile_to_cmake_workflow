@@ -9,6 +9,33 @@
   "opencode_timeout_seconds": 1800,
   "analysis_opencode_timeout_seconds": 1800,
   "conversion_opencode_timeout_seconds": 1800,
+  "build_fix_opencode_timeout_seconds": 1800,
+  "build_fix_opencode_retries": 1,
+  "build_command_timeout_seconds": 3600,
+  "max_fix_attempts": 8,
+  "max_same_failure": 3,
+  "error_excerpt_lines": 180,
+  "build_repair_log": "workflow_v3/state/build_repair_log.md",
+  "build_repair_state_file": "workflow_v3/state/build_repair_state.json",
+  "manual_required_file": "workflow_v3/state/manual_required.md",
+  "build_experience_file": "workflow_v3/state/build_experience.md",
+  "build_experience_max_lines": 160,
+  "build_experience_prompt_lines": 80,
+  "build_repair_snapshot_roots": [
+    "demo/cjson/src"
+  ],
+  "build_commands": [
+    {
+      "name": "configure",
+      "cwd": ".",
+      "command": "cmake -S demo/cjson/src -B demo/cjson/cmake-build -G Ninja"
+    },
+    {
+      "name": "build",
+      "cwd": ".",
+      "command": "cmake --build demo/cjson/cmake-build -j 4"
+    }
+  ],
   "mk_file_patterns": [
     "Android.mk",
     "*.mk",

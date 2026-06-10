@@ -105,6 +105,17 @@ def fake_conversion(prompt: str) -> int:
     return 0
 
 
+def fake_build_fix(prompt: str) -> int:
+    signature = extract_backtick_value(prompt, "Failure signature:")
+    print("# fake v3 build fixer")
+    print()
+    print(f"- suspected root cause: fake mode did not inspect or edit files for signature `{signature or 'unknown'}`")
+    print("- files changed: none")
+    print("- why this advances the build: it does not; this only validates workflow plumbing")
+    print("- remaining risk: rerun with a real opencode binary for actual repair")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("command", nargs="?")
@@ -118,6 +129,8 @@ def main(argv: list[str]) -> int:
         return fake_analysis(prompt)
     if agent == "v3-cmake-converter":
         return fake_conversion(prompt)
+    if agent == "v3-build-fixer":
+        return fake_build_fix(prompt)
     raise SystemExit(f"fake_opencode does not support agent: {agent}")
 
 
