@@ -102,6 +102,85 @@ def shell_env(cfg: dict[str, Any]) -> dict[str, str]:
     return env
 
 
+def text_from_timeout(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def timeout_output(exc: subprocess.TimeoutExpired) -> tuple[str, str]:
+    return text_from_timeout(getattr(exc, "stdout", None) or getattr(exc, "output", None)), text_from_timeout(
+        getattr(exc, "stderr", None)
+    )
+
+
+def terminate_process_group(proc: subprocess.Popen[str], sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def descendant_pids(root_pid: int) -> list[int]:
+    children_by_parent: dict[int, list[int]] = {}
+    proc_root = pathlib.Path("/proc")
+    if not proc_root.exists():
+        return []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        pid = None
+        ppid = None
+        for line in status.splitlines():
+            if line.startswith("Pid:"):
+                pid = int(line.split()[1])
+            elif line.startswith("PPid:"):
+                ppid = int(line.split()[1])
+            if pid is not None and ppid is not None:
+                break
+        if pid is None or ppid is None:
+            continue
+        children_by_parent.setdefault(ppid, []).append(pid)
+
+    descendants: list[int] = []
+    stack = list(children_by_parent.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        descendants.append(pid)
+        stack.extend(children_by_parent.get(pid, []))
+    return descendants
+
+
+def terminate_process_tree(proc: subprocess.Popen[str], sig: int, known_descendants: list[int] | None = None) -> list[int]:
+    descendants = set(known_descendants or [])
+    descendants.update(descendant_pids(proc.pid))
+    terminate_process_group(proc, sig)
+    for pid in sorted(descendants, reverse=True):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    return sorted(descendants)
+
+
+def close_process_pipes(proc: subprocess.Popen[str]) -> None:
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
 def run(
     cmd: list[str],
     cfg: dict[str, Any],
@@ -123,19 +202,27 @@ def run(
     try:
         stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr = timeout_output(exc)
+        descendants = terminate_process_tree(proc, signal.SIGTERM)
         try:
             stdout, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as term_exc:
+            term_stdout, term_stderr = timeout_output(term_exc)
+            stdout = term_stdout or stdout
+            stderr = term_stderr or stderr
+            terminate_process_tree(proc, signal.SIGKILL, descendants)
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = proc.communicate()
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired as kill_exc:
+                kill_stdout, kill_stderr = timeout_output(kill_exc)
+                stdout = kill_stdout or stdout
+                stderr = kill_stderr or stderr
+                close_process_pipes(proc)
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
         timeout_msg = f"\n[TIMEOUT] command exceeded timeout_seconds={timeout}; process group was terminated.\n"
         return subprocess.CompletedProcess(
             cmd,
