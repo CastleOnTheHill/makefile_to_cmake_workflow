@@ -36,6 +36,12 @@ from common import (
 
 TEXT_FILE_NAMES = {"Android.mk", "CMakeLists.txt", "Makefile"}
 SNAPSHOT_FILE_NAMES = {"CMakeLists.txt"}
+EXPERIENCE_HEADER = [
+    "# workflow_v3 Build Repair Experience",
+    "",
+    "One concise lesson per line. Keep only the bug pattern and the CMake fix.",
+    "",
+]
 
 
 @dataclass(frozen=True)
@@ -613,7 +619,7 @@ def read_experience_for_prompt(cfg: dict[str, Any]) -> str:
     path = state_file(cfg, "build_experience_file", "build_experience.md")
     if not path.exists():
         return "_No build repair experience has been recorded yet._"
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.startswith("- ")]
     prompt_lines = int(cfg.get("build_experience_prompt_lines", 80))
     return "\n".join(lines[-prompt_lines:])
 
@@ -632,27 +638,12 @@ def compact_experience(cfg: dict[str, Any]) -> None:
     if not path.exists():
         return
     max_lines = int(cfg.get("build_experience_max_lines", 160))
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    if len(lines) <= max_lines:
-        return
-
-    header = [
-        "# workflow_v3 Build Repair Experience",
-        "",
-        "Keep this file compact. New conversion and build repair prompts use the tail of this file.",
-        "",
-    ]
-    bullets = [line for line in lines if line.startswith("- ")]
-    deduped_reversed: list[str] = []
-    seen: set[str] = set()
-    for line in reversed(bullets):
-        key = re.sub(r"^\- \[[^\]]+\]\s*", "- ", line)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped_reversed.append(line)
-    kept = list(reversed(deduped_reversed))[-max(20, max_lines - len(header)) :]
-    path.write_text("\n".join(header + kept).rstrip() + "\n", encoding="utf-8")
+    bullets = normalize_experience_lines(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    merged: list[str] = []
+    for bullet in bullets:
+        merge_experience_line(merged, bullet)
+    kept = merged[-max(20, max_lines - len(EXPERIENCE_HEADER)) :]
+    write_text(path, "\n".join(EXPERIENCE_HEADER + kept).rstrip() + "\n")
 
 
 def one_line(text: str, limit: int = 320) -> str:
@@ -660,20 +651,110 @@ def one_line(text: str, limit: int = 320) -> str:
     return compact[:limit] + ("..." if len(compact) > limit else "")
 
 
+def clean_lesson_text(text: str, limit: int = 180) -> str:
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\[[^\]]+\]\s*", "", text)
+    text = re.sub(r"\bsignature\s+[0-9a-f]{8,}\b", "", text, flags=re.I)
+    text = re.sub(r"\bsignature\s*`?[0-9a-f]{8,}`?", "", text, flags=re.I)
+    text = re.sub(r"\bfiles?:\s*[^;。]*", "", text, flags=re.I)
+    text = re.sub(r"\bremaining risk:\s*.*", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" -;,.。")
+    return text[:limit].rstrip(" -;,.。") + ("..." if len(text) > limit else "")
+
+
+def labeled_value(text: str, labels: list[str]) -> str:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    all_labels = (
+        "suspected root cause|root cause|cause|fix|solution|why this advances the build|"
+        "files changed|remaining risk|问题|原因|修复|方案|风险"
+    )
+    boundary = rf"(?:\n\s*(?:[-*]\s*)?|\s+[-*]\s+|\s*[;。]\s*)(?:{all_labels})\s*[:：]"
+    pattern = re.compile(rf"(?:^|[-*\n]\s*)({label_pattern})\s*[:：]\s*(.*?)(?={boundary}|\Z)", re.I | re.S)
+    match = pattern.search(text)
+    return clean_lesson_text(match.group(2)) if match else ""
+
+
+def experience_lesson(pending_fix: dict[str, Any], outcome: str) -> str:
+    summary = str(pending_fix.get("summary") or "")
+    cause = labeled_value(summary, ["suspected root cause", "root cause", "cause", "问题", "原因"])
+    fix = labeled_value(summary, ["fix", "solution", "why this advances the build", "修复", "方案"])
+    if not cause:
+        cause = clean_lesson_text(summary)
+    if not fix and outcome.startswith("advanced to new failure signature"):
+        fix = "按该修复后构建推进到下一类错误"
+    if not fix and "all configured build commands passed" in outcome:
+        fix = "按该修复后配置的构建命令通过"
+    if fix:
+        lesson = f"{cause}; fix: {fix}"
+    else:
+        lesson = cause
+    lesson = clean_lesson_text(lesson, 260)
+    return f"- {lesson}" if lesson else ""
+
+
+def normalize_experience_lines(lines: list[str]) -> list[str]:
+    bullets: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line.startswith("- "):
+            continue
+        if "signature `" in line or line.startswith("- ["):
+            match = re.search(r"fix:\s*(.*?)(?:;\s*files:|$)", line)
+            line = f"- {clean_lesson_text(match.group(1) if match else line)}"
+        else:
+            line = f"- {clean_lesson_text(line[2:])}"
+        if len(line) > 3:
+            bullets.append(line)
+    return bullets
+
+
+def experience_tokens(line: str) -> set[str]:
+    normalized = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff]+", " ", line.lower())
+    tokens = {token for token in normalized.split() if len(token) > 1}
+    return tokens - {"fix", "cmake", "cmakelists", "txt", "the", "and", "for", "with", "that", "this"}
+
+
+def experience_similarity(left: str, right: str) -> float:
+    left_tokens = experience_tokens(left)
+    right_tokens = experience_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def similar_experience(left: str, right: str) -> bool:
+    left_tokens = experience_tokens(left)
+    right_tokens = experience_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    return experience_similarity(left, right) >= 0.35 or len(left_tokens & right_tokens) >= 3
+
+
+def better_experience_line(old: str, new: str) -> str:
+    if len(new) < len(old) * 0.75:
+        return new
+    old_has_fix = "; fix:" in old
+    new_has_fix = "; fix:" in new
+    if new_has_fix and not old_has_fix:
+        return new
+    return old if len(old) <= len(new) else new
+
+
+def merge_experience_line(lines: list[str], new_line: str) -> None:
+    for index, old_line in enumerate(lines):
+        if similar_experience(old_line, new_line):
+            lines[index] = better_experience_line(old_line, new_line)
+            return
+    lines.append(new_line)
+
+
 def append_experience(cfg: dict[str, Any], pending_fix: dict[str, Any], outcome: str) -> None:
     path = state_file(cfg, "build_experience_file", "build_experience.md")
-    if not path.exists():
-        write_text(
-            path,
-            "# workflow_v3 Build Repair Experience\n\n"
-            "Keep this file compact. New conversion and build repair prompts use the tail of this file.\n\n",
-        )
-    files = ", ".join(pending_fix.get("changed_files") or [])
-    summary = one_line(str(pending_fix.get("summary") or ""))
-    append_text(
-        path,
-        f"- [{now()}] signature `{pending_fix.get('signature')}` -> {outcome}; fix: {summary}; files: {files}\n",
-    )
+    lines = normalize_experience_lines(path.read_text(encoding="utf-8", errors="replace").splitlines()) if path.exists() else []
+    lesson = experience_lesson(pending_fix, outcome)
+    if len(lesson) > 3:
+        merge_experience_line(lines, lesson)
+    write_text(path, "\n".join(EXPERIENCE_HEADER + lines).rstrip() + "\n")
     compact_experience(cfg)
 
 

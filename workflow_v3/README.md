@@ -127,7 +127,9 @@ Important files:
 - `build_repair_state.json`: resume state.
 - `build_repair.lock`: active-run lock; stale locks are detected by pid.
 - `build_manual_experience.md`: human-maintained repair guidance passed to the fixer.
-- `build_experience.md`: compact lessons learned from successful progress.
+- `build_experience.md`: short bug-pattern-to-CMake-fix lessons. Runtime details
+  such as timestamps, signatures, and changed file lists stay in
+  `build_repair_log.md`.
 - `manual_required.md`: current handoff when progress stalls or the fixer fails.
 
 If the same failure signature repeats `max_same_failure` times, the script

@@ -143,7 +143,7 @@ def build_experience_for_prompt(cfg: dict) -> str:
         experience_path = pathlib.Path(cfg["state_dir"]) / "build_experience.md"
     if not experience_path.exists():
         return "_No build repair experience has been recorded yet._"
-    lines = experience_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = [line for line in experience_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.startswith("- ")]
     prompt_lines = int(cfg.get("build_experience_prompt_lines", 80))
     return "\n".join(lines[-prompt_lines:])
 
