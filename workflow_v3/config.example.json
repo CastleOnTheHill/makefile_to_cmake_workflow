@@ -17,6 +17,7 @@
   "error_excerpt_lines": 180,
   "build_repair_log": "workflow_v3/state/build_repair_log.md",
   "build_repair_state_file": "workflow_v3/state/build_repair_state.json",
+  "build_repair_lock_file": "workflow_v3/state/build_repair.lock",
   "manual_required_file": "workflow_v3/state/manual_required.md",
   "build_manual_experience_file": "workflow_v3/state/build_manual_experience.md",
   "build_experience_file": "workflow_v3/state/build_experience.md",
@@ -24,6 +25,10 @@
   "build_experience_prompt_lines": 80,
   "build_manual_experience_prompt_lines": 120,
   "build_repair_echo_output": true,
+  "build_repair_output_tail_lines": 2000,
+  "build_repair_log_flush_seconds": 5,
+  "build_repair_heartbeat_seconds": 30,
+  "build_repair_fallback_scan_mk": false,
   "build_repair_snapshot_roots": [
     "demo/cjson/src"
   ],

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import collections
 import difflib
 import fnmatch
 import json
@@ -10,6 +11,7 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ from common import (
     resolve_path,
     run,
     shell_env,
+    terminate_process_tree,
     write_text,
 )
 
@@ -75,19 +78,109 @@ def append_text(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8") as f:
-        value = json.load(f)
+    try:
+        with path.open(encoding="utf-8") as f:
+            value = json.load(f)
+    except json.JSONDecodeError:
+        corrupt_path = path.with_name(f"{path.name}.corrupt.{time.strftime('%Y%m%d%H%M%S')}")
+        try:
+            path.replace(corrupt_path)
+            print(f"[state] ignored corrupt state file; moved to {corrupt_path}", flush=True)
+        except OSError:
+            print(f"[state] ignored corrupt state file: {path}", flush=True)
+        return {}
     return value if isinstance(value, dict) else {}
 
 
 def write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def process_cmdline(pid: int) -> str:
+    try:
+        data = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return data.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
+def process_looks_like_build_repair(pid: int) -> bool:
+    cmdline = process_cmdline(pid)
+    if not cmdline:
+        return True
+    return "build_repair_loop.py" in cmdline
+
+
+class BuildRepairLock:
+    def __init__(self, path: pathlib.Path):
+        self.path = path
+        self.acquired = False
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {"pid": os.getpid(), "started_at": now(), "cmdline": " ".join(sys.argv)},
+            ensure_ascii=False,
+            sort_keys=True,
+        ) + "\n"
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                lock = read_json(self.path)
+                pid = int(lock.get("pid") or 0)
+                if pid and pid != os.getpid() and process_alive(pid) and process_looks_like_build_repair(pid):
+                    raise SystemExit(f"another build repair loop is running: pid={pid}; lock={self.path}")
+                stale_path = self.path.with_name(f"{self.path.name}.stale.{time.strftime('%Y%m%d%H%M%S')}")
+                try:
+                    self.path.replace(stale_path)
+                    print(f"[lock] moved stale lock to {stale_path}", flush=True)
+                except OSError:
+                    self.path.unlink(missing_ok=True)
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            self.acquired = True
+            print(f"[lock] acquired {self.path}", flush=True)
+            return
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            current = read_json(self.path)
+            if int(current.get("pid") or 0) == os.getpid():
+                self.path.unlink(missing_ok=True)
+        finally:
+            self.acquired = False
+
+    def __enter__(self) -> "BuildRepairLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.release()
 
 
 def configured_build_commands(cfg: dict[str, Any]) -> list[BuildCommand]:
@@ -126,8 +219,14 @@ def configured_build_commands(cfg: dict[str, Any]) -> list[BuildCommand]:
     return commands
 
 
-def run_shell_command(command: BuildCommand, cfg: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+def run_shell_command(
+    command: BuildCommand,
+    cfg: dict[str, Any],
+    log_path: pathlib.Path,
+    heartbeat: Any | None = None,
+) -> subprocess.CompletedProcess[str]:
     echo_output = bool(cfg.get("build_repair_echo_output", True))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
         command.command,
         shell=True,
@@ -140,60 +239,115 @@ def run_shell_command(command: BuildCommand, cfg: dict[str, Any]) -> subprocess.
         start_new_session=True,
     )
     output_queue: queue.Queue[str] = queue.Queue()
+    tail_limit = max(100, int(cfg.get("build_repair_output_tail_lines", max(2000, int(cfg.get("error_excerpt_lines", 180)) * 8))))
+    tail: collections.deque[str] = collections.deque(maxlen=tail_limit)
+    flush_seconds = max(1, int(cfg.get("build_repair_log_flush_seconds", 5)))
+    heartbeat_seconds = max(5, int(cfg.get("build_repair_heartbeat_seconds", 30)))
+    start_time = time.monotonic()
+    next_flush = start_time + flush_seconds
+    next_heartbeat = start_time + heartbeat_seconds
 
     def read_output() -> None:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            output_queue.put(line)
+        try:
+            for line in proc.stdout:
+                output_queue.put(line)
+        except OSError:
+            pass
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
-    lines: list[str] = []
+    known_descendants: list[int] = []
 
-    def drain_output() -> None:
+    def flush_log(log_file: Any) -> None:
+        log_file.flush()
+
+    def drain_output(log_file: Any) -> None:
         while True:
             try:
                 line = output_queue.get_nowait()
             except queue.Empty:
                 return
-            lines.append(line)
+            tail.append(line)
+            log_file.write(line)
             if echo_output:
                 print(line, end="", flush=True)
 
-    deadline = time.monotonic() + command.timeout
-    timed_out = False
-    while proc.poll() is None:
-        drain_output()
-        if time.monotonic() > deadline:
-            timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            break
-        time.sleep(0.1)
+    def terminate_process(sig: int) -> None:
+        nonlocal known_descendants
+        known_descendants = terminate_process_tree(proc, sig, known_descendants)
 
-    if timed_out:
+    def finish_after_termination(log_file: Any, timeout_msg: str, returncode: int) -> subprocess.CompletedProcess[str]:
         stop_deadline = time.monotonic() + 5
         while proc.poll() is None and time.monotonic() < stop_deadline:
-            drain_output()
+            drain_output(log_file)
             time.sleep(0.1)
         if proc.poll() is None:
+            terminate_process(signal.SIGKILL)
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if proc.stdout is not None:
+                    try:
+                        proc.stdout.close()
+                    except OSError:
+                        pass
         reader.join(timeout=5)
-        drain_output()
-        timeout_msg = f"\n[TIMEOUT] build command exceeded timeout_seconds={command.timeout}; process group was terminated.\n"
+        drain_output(log_file)
+        tail.append(timeout_msg)
+        log_file.write(timeout_msg)
+        flush_log(log_file)
         if echo_output:
             print(timeout_msg, end="", flush=True)
-        return subprocess.CompletedProcess(command.command, TIMEOUT_RETURNCODE, "".join(lines) + timeout_msg, "")
+        return subprocess.CompletedProcess(command.command, returncode, "".join(tail), "")
 
-    reader.join(timeout=5)
-    drain_output()
-    return subprocess.CompletedProcess(command.command, proc.returncode, "".join(lines), "")
+    deadline = time.monotonic() + command.timeout
+    with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+        try:
+            while proc.poll() is None:
+                drain_output(log_file)
+                current = time.monotonic()
+                if current >= next_flush:
+                    flush_log(log_file)
+                    next_flush = current + flush_seconds
+                if current >= next_heartbeat:
+                    elapsed = int(current - start_time)
+                    print(f"[build] still running name={command.name} elapsed={elapsed}s log={log_path}", flush=True)
+                    if heartbeat:
+                        heartbeat(elapsed)
+                    next_heartbeat = current + heartbeat_seconds
+                if current > deadline:
+                    terminate_process(signal.SIGTERM)
+                    timeout_msg = (
+                        f"\n[TIMEOUT] build command exceeded timeout_seconds={command.timeout}; "
+                        "process group was terminated.\n"
+                    )
+                    return finish_after_termination(log_file, timeout_msg, TIMEOUT_RETURNCODE)
+                time.sleep(0.1)
+        except BaseException:
+            terminate_process(signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                terminate_process(signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+            reader.join(timeout=5)
+            drain_output(log_file)
+            flush_log(log_file)
+            raise
+
+        reader.join(timeout=5)
+        drain_output(log_file)
+        flush_log(log_file)
+    return subprocess.CompletedProcess(command.command, proc.returncode, "".join(tail), "")
 
 
 def relative_to_project(cfg: dict[str, Any], path: pathlib.Path) -> str:
@@ -426,7 +580,7 @@ def find_related_mk_files(
         if len(related) >= limit:
             return related[:limit]
 
-    if not related and scan_root.exists():
+    if not related and scan_root.exists() and bool(cfg.get("build_repair_fallback_scan_mk", False)):
         for dirpath, dirnames, filenames in os.walk(scan_root):
             current = pathlib.Path(dirpath)
             dirnames[:] = [name for name in dirnames if not should_ignore_dir(cfg, current / name)]
@@ -692,17 +846,39 @@ def run_build_sequence(
     cfg: dict[str, Any],
     commands: list[BuildCommand],
     attempt: int,
+    state: dict[str, Any],
+    state_path: pathlib.Path,
+    run_id: str,
 ) -> tuple[BuildCommand, subprocess.CompletedProcess[str], pathlib.Path] | None:
     logs_dir = pathlib.Path(cfg["state_dir"]) / "logs"
     for index, command in enumerate(commands, start=1):
+        log_path = logs_dir / f"build.{attempt:03d}.{index:02d}-{sanitize_name(command.name)}.log"
+        state.update(
+            {
+                "status": "running",
+                "phase": "build_command",
+                "run_id": run_id,
+                "attempt": attempt,
+                "command_index": index,
+                "command_count": len(commands),
+                "current_command": command.name,
+                "current_log": rel(log_path),
+                "updated_at": now(),
+            }
+        )
+        write_json(state_path, state)
         print(f"[build] attempt={attempt} command={index}/{len(commands)} name={command.name}", flush=True)
         print(f"  cwd: {command.cwd}", flush=True)
         print(f"  command: {command.command}", flush=True)
         print(f"  timeout: {command.timeout}s", flush=True)
+        print(f"  log: {log_path}", flush=True)
         print("  output:", flush=True)
-        cp = run_shell_command(command, cfg)
-        log_path = logs_dir / f"build.{attempt:03d}.{index:02d}-{sanitize_name(command.name)}.log"
-        write_text(log_path, cp.stdout)
+
+        def heartbeat(elapsed: int) -> None:
+            state.update({"heartbeat_at": now(), "elapsed_seconds": elapsed, "updated_at": now()})
+            write_json(state_path, state)
+
+        cp = run_shell_command(command, cfg, log_path, heartbeat)
         print(f"[build] command finished returncode={cp.returncode} log={log_path}", flush=True)
         if cp.returncode != 0:
             return command, cp, log_path
@@ -807,6 +983,45 @@ def append_fix_log(
     )
 
 
+def max_recorded_attempt(cfg: dict[str, Any]) -> int:
+    pattern = re.compile(r"(?:build|build-fix)\.(\d+)\.")
+    max_attempt = 0
+    for directory_name in ("logs", "prompts", "opencode_results"):
+        directory = pathlib.Path(cfg["state_dir"]) / directory_name
+        if not directory.exists():
+            continue
+        for path in directory.iterdir():
+            match = pattern.search(path.name)
+            if match:
+                max_attempt = max(max_attempt, int(match.group(1)))
+    return max_attempt
+
+
+def install_shutdown_signal_handlers() -> None:
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
+
+def append_resume_log(cfg: dict[str, Any], title: str, state: dict[str, Any]) -> None:
+    append_text(
+        state_file(cfg, "build_repair_log", "build_repair_log.md"),
+        "\n".join(
+            [
+                f"\n## {title}",
+                "",
+                f"- Time: `{now()}`",
+                f"- Previous status: `{state.get('status', 'unknown')}`",
+                f"- Previous phase: `{state.get('phase', 'unknown')}`",
+                f"- Previous attempt: `{state.get('attempt', 'unknown')}`",
+                "",
+            ]
+        ),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run workflow_v3 configure/build commands and repair failures with OpenCode.")
     parser.add_argument("config")
@@ -814,164 +1029,241 @@ def main() -> int:
     parser.add_argument("--reset-state", action="store_true", help="reset build repair state before running")
     args = parser.parse_args()
 
+    install_shutdown_signal_handlers()
     cfg = load_config(args.config)
-    commands = configured_build_commands(cfg)
+    lock_path = state_file(cfg, "build_repair_lock_file", "build_repair.lock")
     state_path = state_file(cfg, "build_repair_state_file", "build_repair_state.json")
-    if args.reset_state and state_path.exists():
-        state_path.unlink()
+    run_id = f"{int(time.time())}-{os.getpid()}"
+    state: dict[str, Any] = {}
 
-    state = read_json(state_path)
-    if state.get("status") == "manual_required":
-        append_text(
-            state_file(cfg, "build_repair_log", "build_repair_log.md"),
-            f"\n## Resume after manual handoff\n\n- Time: `{now()}`\n\n",
-        )
-        state = {}
+    with BuildRepairLock(lock_path):
+        commands = configured_build_commands(cfg)
+        if args.reset_state and state_path.exists():
+            state_path.unlink()
 
-    max_attempts = int(cfg.get("max_fix_attempts", cfg.get("max_fix_attempts_per_product", 8)))
-    if args.limit_attempts > 0:
-        max_attempts = min(max_attempts, args.limit_attempts)
-    max_same = int(cfg.get("max_same_failure", 3))
-    excerpt_lines = int(cfg.get("error_excerpt_lines", 180))
-    seen: dict[str, int] = dict(state.get("seen_signatures") or {})
-    pending_fix = state.get("pending_fix") if isinstance(state.get("pending_fix"), dict) else None
+        state = read_json(state_path)
+        previous_attempt = int(state.get("attempt") or 0)
+        if state.get("status") == "manual_required":
+            append_resume_log(cfg, "Resume after manual handoff", state)
+            state = {"attempt": previous_attempt}
+        elif state.get("status") in {"running", "failed", "fixing", "interrupted"}:
+            append_resume_log(cfg, "Resume after interrupted build repair run", state)
+        elif state.get("status") == "done":
+            append_resume_log(cfg, "Recheck after completed build repair run", state)
+            state = {"attempt": previous_attempt}
 
-    for attempt in range(1, max_attempts + 1):
-        progress(attempt, max_attempts, "build repair")
-        state.update({"status": "running", "attempt": attempt, "updated_at": now(), "seen_signatures": seen})
-        write_json(state_path, state)
+        max_attempts = int(cfg.get("max_fix_attempts", cfg.get("max_fix_attempts_per_product", 8)))
+        run_budget = args.limit_attempts if args.limit_attempts > 0 else max_attempts
+        max_same = int(cfg.get("max_same_failure", 3))
+        excerpt_lines = int(cfg.get("error_excerpt_lines", 180))
+        recorded_attempt = max_recorded_attempt(cfg)
+        start_attempt = max(int(state.get("attempt") or 0), recorded_attempt) + 1
+        seen: dict[str, int] = dict(state.get("seen_signatures") or {})
+        pending_fix = state.get("pending_fix") if isinstance(state.get("pending_fix"), dict) else None
 
-        failure = run_build_sequence(cfg, commands, attempt)
-        if failure is None:
-            if pending_fix:
-                append_experience(cfg, pending_fix, "all configured build commands passed")
-                pending_fix = None
+        try:
+            for run_index, attempt in enumerate(range(start_attempt, start_attempt + run_budget), start=1):
+                progress(run_index, run_budget, f"build repair attempt={attempt}")
+                state.update(
+                    {
+                        "status": "running",
+                        "phase": "attempt_start",
+                        "run_id": run_id,
+                        "pid": os.getpid(),
+                        "attempt": attempt,
+                        "run_attempt_index": run_index,
+                        "run_attempt_budget": run_budget,
+                        "updated_at": now(),
+                        "seen_signatures": seen,
+                    }
+                )
+                write_json(state_path, state)
+
+                failure = run_build_sequence(cfg, commands, attempt, state, state_path, run_id)
+                if failure is None:
+                    if pending_fix:
+                        append_experience(cfg, pending_fix, "all configured build commands passed")
+                        pending_fix = None
+                    append_text(
+                        state_file(cfg, "build_repair_log", "build_repair_log.md"),
+                        f"\n## Attempt {attempt}: all build commands passed\n\n- Time: `{now()}`\n\n",
+                    )
+                    state.update(
+                        {
+                            "status": "done",
+                            "phase": "done",
+                            "updated_at": now(),
+                            "pending_fix": None,
+                            "current_command": None,
+                        }
+                    )
+                    write_json(state_path, state)
+                    print("[build] all configured build commands passed", flush=True)
+                    return 0
+
+                command, cp, build_log = failure
+                excerpt = error_excerpt(cp.stdout, excerpt_lines)
+                signature = failure_signature(cp.stdout, excerpt_lines)
+                key = failure_key(cp.stdout, excerpt_lines)
+                print(f"[build] failed command={command.name} signature={signature}", flush=True)
+                print("[build] latest error excerpt:", flush=True)
+                print(excerpt, flush=True)
+
+                if pending_fix and pending_fix.get("signature") != signature:
+                    append_experience(cfg, pending_fix, f"advanced to new failure signature `{signature}`")
+                    pending_fix = None
+
+                seen[signature] = int(seen.get(signature, 0)) + 1
+                same_count = seen[signature]
+                append_build_failure_log(cfg, attempt, command, cp, build_log, signature, same_count, excerpt)
+                state.update(
+                    {
+                        "status": "failed",
+                        "phase": "build_failed",
+                        "attempt": attempt,
+                        "failed_command": command.name,
+                        "failure_signature": signature,
+                        "failure_key": key,
+                        "same_signature_count": same_count,
+                        "last_log": rel(build_log),
+                        "updated_at": now(),
+                        "seen_signatures": seen,
+                        "pending_fix": pending_fix,
+                    }
+                )
+                write_json(state_path, state)
+
+                if same_count >= max_same:
+                    write_manual_handoff(
+                        cfg,
+                        "build progress stalled",
+                        "\n".join(
+                            [
+                                f"- Failed command: `{command.name}`",
+                                f"- Failure signature: `{signature}` repeated `{same_count}` time(s).",
+                                f"- Last build log: `{rel(build_log)}`",
+                                "",
+                                "Latest failure key:",
+                                "",
+                                "```text",
+                                key,
+                                "```",
+                            ]
+                        ),
+                        state,
+                    )
+                    print(
+                        f"[build] stalled on signature {signature}; see {state_file(cfg, 'manual_required_file', 'manual_required.md')}",
+                        flush=True,
+                    )
+                    return 10
+
+                print("[snapshot] taking before snapshot for CMakeLists.txt files only...", flush=True)
+                state.update({"status": "running", "phase": "snapshot_before", "updated_at": now()})
+                write_json(state_path, state)
+                before = take_snapshot(cfg)
+                print(f"[snapshot] tracked before={len(before)} CMakeLists.txt file(s)", flush=True)
+                state.update({"status": "fixing", "phase": "opencode_fix", "updated_at": now()})
+                write_json(state_path, state)
+                fixer_cp, prompt_path, stdout_path, stderr_path, retry_index = run_fixer(
+                    cfg, command, attempt, signature, excerpt, build_log
+                )
+                print("[snapshot] taking after snapshot for CMakeLists.txt files only...", flush=True)
+                state.update(
+                    {
+                        "status": "running",
+                        "phase": "snapshot_after",
+                        "fixer_returncode": fixer_cp.returncode,
+                        "fixer_stdout": rel(stdout_path),
+                        "fixer_stderr": rel(stderr_path),
+                        "updated_at": now(),
+                    }
+                )
+                write_json(state_path, state)
+                after = take_snapshot(cfg)
+                print(f"[snapshot] tracked after={len(after)} CMakeLists.txt file(s)", flush=True)
+                changes = diff_snapshots(before, after)
+                print(f"[snapshot] detected {len(changes)} changed CMakeLists.txt file(s)", flush=True)
+
+                deleted = [change for change in changes if change.status == "deleted"]
+                if deleted:
+                    restored = restore_deleted_files(cfg, before, changes)
+                    append_fix_log(cfg, attempt, fixer_cp, prompt_path, stdout_path, stderr_path, retry_index, changes)
+                    write_manual_handoff(
+                        cfg,
+                        "fixer deleted files",
+                        "\n".join(
+                            [
+                                "The build fixer deleted files, which is not allowed.",
+                                f"- Deleted files: `{', '.join(change.rel_path for change in deleted)}`",
+                                f"- Restored files: `{', '.join(restored) if restored else 'none'}`",
+                                f"- Fixer stdout: `{rel(stdout_path)}`",
+                                f"- Fixer stderr: `{rel(stderr_path)}`",
+                            ]
+                        ),
+                        state,
+                    )
+                    return 12
+
+                append_fix_log(cfg, attempt, fixer_cp, prompt_path, stdout_path, stderr_path, retry_index, changes)
+                if fixer_cp.returncode != 0:
+                    write_manual_handoff(
+                        cfg,
+                        "build fixer failed",
+                        "\n".join(
+                            [
+                                f"- Fixer return code: `{fixer_cp.returncode}`",
+                                f"- Prompt: `{rel(prompt_path)}`",
+                                f"- Fixer stdout: `{rel(stdout_path)}`",
+                                f"- Fixer stderr: `{rel(stderr_path)}`",
+                            ]
+                        ),
+                        state,
+                    )
+                    return 11
+
+                pending_fix = {
+                    "signature": signature,
+                    "summary": one_line(fixer_cp.stdout),
+                    "changed_files": [change.rel_path for change in changes],
+                    "attempt": attempt,
+                    "time": now(),
+                }
+                state.update(
+                    {
+                        "status": "running",
+                        "phase": "fix_applied",
+                        "pending_fix": pending_fix,
+                        "updated_at": now(),
+                    }
+                )
+                write_json(state_path, state)
+
+            write_manual_handoff(
+                cfg,
+                "max fix attempts exceeded",
+                f"- Max attempts for this run: `{run_budget}`\n- Last state file: `{rel(state_path)}`",
+                state,
+            )
+            return 13
+        except KeyboardInterrupt as exc:
+            state.update(
+                {
+                    "status": "interrupted",
+                    "phase": state.get("phase") or "unknown",
+                    "run_id": run_id,
+                    "pid": os.getpid(),
+                    "updated_at": now(),
+                    "interrupt_reason": str(exc) or "KeyboardInterrupt",
+                }
+            )
+            write_json(state_path, state)
             append_text(
                 state_file(cfg, "build_repair_log", "build_repair_log.md"),
-                f"\n## Attempt {attempt}: all build commands passed\n\n- Time: `{now()}`\n\n",
+                f"\n## Interrupted\n\n- Time: `{now()}`\n- Attempt: `{state.get('attempt')}`\n- Phase: `{state.get('phase')}`\n\n",
             )
-            state.update({"status": "done", "updated_at": now(), "pending_fix": None})
-            write_json(state_path, state)
-            print("[build] all configured build commands passed", flush=True)
-            return 0
-
-        command, cp, build_log = failure
-        excerpt = error_excerpt(cp.stdout, excerpt_lines)
-        signature = failure_signature(cp.stdout, excerpt_lines)
-        key = failure_key(cp.stdout, excerpt_lines)
-        print(f"[build] failed command={command.name} signature={signature}", flush=True)
-        print("[build] latest error excerpt:", flush=True)
-        print(excerpt, flush=True)
-
-        if pending_fix and pending_fix.get("signature") != signature:
-            append_experience(cfg, pending_fix, f"advanced to new failure signature `{signature}`")
-            pending_fix = None
-
-        seen[signature] = int(seen.get(signature, 0)) + 1
-        same_count = seen[signature]
-        append_build_failure_log(cfg, attempt, command, cp, build_log, signature, same_count, excerpt)
-        state.update(
-            {
-                "status": "failed",
-                "attempt": attempt,
-                "failed_command": command.name,
-                "failure_signature": signature,
-                "failure_key": key,
-                "same_signature_count": same_count,
-                "last_log": rel(build_log),
-                "updated_at": now(),
-                "seen_signatures": seen,
-                "pending_fix": pending_fix,
-            }
-        )
-        write_json(state_path, state)
-
-        if same_count >= max_same:
-            write_manual_handoff(
-                cfg,
-                "build progress stalled",
-                "\n".join(
-                    [
-                        f"- Failed command: `{command.name}`",
-                        f"- Failure signature: `{signature}` repeated `{same_count}` time(s).",
-                        f"- Last build log: `{rel(build_log)}`",
-                        "",
-                        "Latest failure key:",
-                        "",
-                        "```text",
-                        key,
-                        "```",
-                    ]
-                ),
-                state,
-            )
-            print(f"[build] stalled on signature {signature}; see {state_file(cfg, 'manual_required_file', 'manual_required.md')}", flush=True)
-            return 10
-
-        print("[snapshot] taking before snapshot for CMakeLists.txt files only...", flush=True)
-        before = take_snapshot(cfg)
-        print(f"[snapshot] tracked before={len(before)} CMakeLists.txt file(s)", flush=True)
-        fixer_cp, prompt_path, stdout_path, stderr_path, retry_index = run_fixer(cfg, command, attempt, signature, excerpt, build_log)
-        print("[snapshot] taking after snapshot for CMakeLists.txt files only...", flush=True)
-        after = take_snapshot(cfg)
-        print(f"[snapshot] tracked after={len(after)} CMakeLists.txt file(s)", flush=True)
-        changes = diff_snapshots(before, after)
-        print(f"[snapshot] detected {len(changes)} changed CMakeLists.txt file(s)", flush=True)
-
-        deleted = [change for change in changes if change.status == "deleted"]
-        if deleted:
-            restored = restore_deleted_files(cfg, before, changes)
-            append_fix_log(cfg, attempt, fixer_cp, prompt_path, stdout_path, stderr_path, retry_index, changes)
-            write_manual_handoff(
-                cfg,
-                "fixer deleted files",
-                "\n".join(
-                    [
-                        "The build fixer deleted files, which is not allowed.",
-                        f"- Deleted files: `{', '.join(change.rel_path for change in deleted)}`",
-                        f"- Restored files: `{', '.join(restored) if restored else 'none'}`",
-                        f"- Fixer stdout: `{rel(stdout_path)}`",
-                        f"- Fixer stderr: `{rel(stderr_path)}`",
-                    ]
-                ),
-                state,
-            )
-            return 12
-
-        append_fix_log(cfg, attempt, fixer_cp, prompt_path, stdout_path, stderr_path, retry_index, changes)
-        if fixer_cp.returncode != 0:
-            write_manual_handoff(
-                cfg,
-                "build fixer failed",
-                "\n".join(
-                    [
-                        f"- Fixer return code: `{fixer_cp.returncode}`",
-                        f"- Prompt: `{rel(prompt_path)}`",
-                        f"- Fixer stdout: `{rel(stdout_path)}`",
-                        f"- Fixer stderr: `{rel(stderr_path)}`",
-                    ]
-                ),
-                state,
-            )
-            return 11
-
-        pending_fix = {
-            "signature": signature,
-            "summary": one_line(fixer_cp.stdout),
-            "changed_files": [change.rel_path for change in changes],
-            "attempt": attempt,
-            "time": now(),
-        }
-        state.update({"pending_fix": pending_fix, "updated_at": now()})
-        write_json(state_path, state)
-
-    write_manual_handoff(
-        cfg,
-        "max fix attempts exceeded",
-        f"- Max attempts for this run: `{max_attempts}`\n- Last state file: `{rel(state_path)}`",
-        state,
-    )
-    return 13
+            print(f"[build] interrupted; state saved to {state_path}", flush=True)
+            return 130
 
 
 if __name__ == "__main__":

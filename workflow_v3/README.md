@@ -103,6 +103,16 @@ it prints the command output, writes the full build log, calls `v3-build-fixer`,
 records the fix summary, and appends per-file `CMakeLists.txt` diffs to
 `build_repair_log.md`.
 
+The loop is designed for long unattended runs. Build output is streamed to
+`state/logs/build.<attempt>.<command>.log` while only a bounded tail is kept in
+memory for failure extraction. `build_repair_state.json` is written atomically
+and refreshed during long-running commands. A lock file prevents two repair
+loops from writing the same state at the same time. If the process is stopped
+with Ctrl+C or SIGTERM, child build/OpenCode processes are terminated, state is
+marked `interrupted`, and the same command can be rerun. If it is killed
+forcibly, rerun the command; the next attempt number is derived from existing
+logs and state so old logs are not overwritten.
+
 The fixer is intentionally restricted to `CMakeLists.txt`. It may read nearby
 mk/Makefile context, but it must not modify source files, headers, Makefile,
 Android.mk, or `*.mk` files. `build_repair_snapshot_roots` controls where the
@@ -115,6 +125,7 @@ Important files:
 
 - `build_repair_log.md`: detailed build failures, fixer summaries, and diffs.
 - `build_repair_state.json`: resume state.
+- `build_repair.lock`: active-run lock; stale locks are detected by pid.
 - `build_manual_experience.md`: human-maintained repair guidance passed to the fixer.
 - `build_experience.md`: compact lessons learned from successful progress.
 - `manual_required.md`: current handoff when progress stalls or the fixer fails.

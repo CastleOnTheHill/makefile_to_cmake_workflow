@@ -6,6 +6,7 @@ import pathlib
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from typing import Any
 
@@ -67,7 +68,28 @@ def progress(index: int, total: int, label: str) -> None:
 
 def write_text(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def read_jsonl(path: pathlib.Path) -> list[dict[str, Any]]:
@@ -230,6 +252,18 @@ def run(
             stdout or "",
             (stderr or "") + timeout_msg,
         )
+    except BaseException:
+        descendants = terminate_process_tree(proc, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(proc, signal.SIGKILL, descendants)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        close_process_pipes(proc)
+        raise
 
 
 def extract_json_objects(text: str) -> list[dict[str, Any]]:
