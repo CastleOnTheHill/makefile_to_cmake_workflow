@@ -464,6 +464,15 @@ def read_experience_for_prompt(cfg: dict[str, Any]) -> str:
     return "\n".join(lines[-prompt_lines:])
 
 
+def read_manual_experience_for_prompt(cfg: dict[str, Any]) -> str:
+    path = state_file(cfg, "build_manual_experience_file", "build_manual_experience.md")
+    if not path.exists():
+        return "_No manual build repair experience file exists yet._"
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    prompt_lines = int(cfg.get("build_manual_experience_prompt_lines", cfg.get("build_experience_prompt_lines", 80)))
+    return "\n".join(lines[-prompt_lines:])
+
+
 def compact_experience(cfg: dict[str, Any]) -> None:
     path = state_file(cfg, "build_experience_file", "build_experience.md")
     if not path.exists():
@@ -540,9 +549,15 @@ Full build log: `%s`
 Build repair log: `%s`
 Manual handoff file: `%s`
 Experience file: `%s`
+Manual experience file: `%s`
 
 Latest error excerpt:
 ```text
+%s
+```
+
+Manual build repair experience maintained by humans:
+```markdown
 %s
 ```
 
@@ -566,7 +581,10 @@ Allowed edit scope:
 
 Requirements:
 
-- Make the smallest edit that should advance the build.
+- Fix the current failure in `CMakeLists.txt`. If the same Makefile-to-CMake
+  mistake is common in sibling or related `CMakeLists.txt` files, apply the
+  same correction consistently to those `CMakeLists.txt` files too.
+- Do not make unrelated rewrites or style-only churn.
 - Do not run configure, build, tests, git, or shell commands.
 - Do not delete files. If a fix would require deleting a file, stop and write a
   concise note to the manual handoff file instead.
@@ -594,7 +612,9 @@ Return concise Markdown with:
         rel(state_file(cfg, "build_repair_log", "build_repair_log.md")),
         rel(state_file(cfg, "manual_required_file", "manual_required.md")),
         rel(state_file(cfg, "build_experience_file", "build_experience.md")),
+        rel(state_file(cfg, "build_manual_experience_file", "build_manual_experience.md")),
         excerpt,
+        read_manual_experience_for_prompt(cfg),
         read_experience_for_prompt(cfg),
         mk_context(cfg, related_mks),
     )
@@ -639,7 +659,7 @@ def run_fixer(
             "--file",
             str(prompt_path),
             "--",
-            "Fix this workflow_v3 build failure with the smallest safe edit.",
+            "Fix this workflow_v3 build failure by editing only CMakeLists.txt files.",
         ]
         print(
             f"[fixer] handing failure to OpenCode agent=v3-build-fixer "

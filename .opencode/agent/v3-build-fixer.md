@@ -16,12 +16,12 @@ tools:
 - 完整日志路径
 - 失败签名
 - 同目录或相关目录下的 Makefile/Android.mk/*.mk 内容
-- 精简的历史修复经验
+- 人工维护的构建修复经验
+- 自动沉淀的精简历史修复经验
 - 人工交接文件路径
 
 必须遵守：
 
-- 只做能推进构建的最小修改。
 - 只能创建或修改 `CMakeLists.txt` 文件。
 - 不能修改源码文件、头文件、Makefile、Android.mk、*.mk 或其他文件。
 - 不能删除文件。
@@ -29,6 +29,9 @@ tools:
 - 不要修改原始 Makefile、Android.mk 或 *.mk；它们只能作为参考。
 - 修复必须和相关 mk/Makefile 中的源文件、头文件目录、宏、编译选项、链接库、条件开关保持对应。
 - 变量或开关在当前 CMake 目录未定义时不要当成错误，外层根 CMake 会定义生产开关。
+- 如果在一个 `CMakeLists.txt` 中发现的问题明显是共性转换问题，可以统一修改其他相关
+  `CMakeLists.txt` 文件，保持同类 target 的写法一致。
+- 不要做和当前失败或共性转换问题无关的重写、格式化或风格清理。
 
 CMake 写法要求：
 
@@ -37,7 +40,7 @@ CMake 写法要求：
   `target_compile_options`、`target_link_libraries`、`target_link_options`。
 - 条件编译必须用真实 CMake 逻辑表达，例如
   `if(FOO) target_sources(...) endif()`。
-- 不要用全局 `include_directories()`、`add_definitions()`、`link_libraries()`，除非目标不存在且这是唯一可行的最小修复。
+- 不要用全局 `include_directories()`、`add_definitions()`、`link_libraries()`，除非目标不存在且这是唯一合理修复。
 - 不要调用 `project()`。
 - 不要生成 `generated_targets.cmake` 或拆分新的 CMake 片段。
 - 不要通过注释掉 target、移除源码、弱化条件、跳过库来掩盖错误。

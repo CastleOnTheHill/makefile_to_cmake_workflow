@@ -18,9 +18,11 @@
   "build_repair_log": "workflow_v3/state/build_repair_log.md",
   "build_repair_state_file": "workflow_v3/state/build_repair_state.json",
   "manual_required_file": "workflow_v3/state/manual_required.md",
+  "build_manual_experience_file": "workflow_v3/state/build_manual_experience.md",
   "build_experience_file": "workflow_v3/state/build_experience.md",
   "build_experience_max_lines": 160,
   "build_experience_prompt_lines": 80,
+  "build_manual_experience_prompt_lines": 120,
   "build_repair_echo_output": true,
   "build_repair_snapshot_roots": [
     "demo/cjson/src"

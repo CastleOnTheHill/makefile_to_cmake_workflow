@@ -107,11 +107,15 @@ The fixer is intentionally restricted to `CMakeLists.txt`. It may read nearby
 mk/Makefile context, but it must not modify source files, headers, Makefile,
 Android.mk, or `*.mk` files. `build_repair_snapshot_roots` controls where the
 script searches for `CMakeLists.txt` files to diff before and after a fix.
+The fixer is not limited to the smallest possible edit: when one failure exposes
+a common conversion issue, it may update other related `CMakeLists.txt` files
+consistently.
 
 Important files:
 
 - `build_repair_log.md`: detailed build failures, fixer summaries, and diffs.
 - `build_repair_state.json`: resume state.
+- `build_manual_experience.md`: human-maintained repair guidance passed to the fixer.
 - `build_experience.md`: compact lessons learned from successful progress.
 - `manual_required.md`: current handoff when progress stalls or the fixer fails.
 
